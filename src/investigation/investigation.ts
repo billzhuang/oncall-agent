@@ -21,7 +21,7 @@ import {
   type AgentHost,
   type WorkspaceTools,
 } from "./agent";
-import { agentBranch, pushAgentPr, reportOnly, retryable, type AgentPrRecord } from "./agent-pr";
+import { agentBranch, protectedPaths, pushAgentPr, reportOnly, retryable, type AgentPrRecord } from "./agent-pr";
 import {
   MAX_EVIDENCE_LINES,
   agentPrBody,
@@ -423,6 +423,9 @@ export class Investigation extends DurableObject<Env> {
     if (reportOnly(config, episode.alert.tags)) return { outcome: "report-only" };
     const changes = await ports().workspace(this.ctx, this.env).changes();
     if (changes.length === 0) return { outcome: "no-changes" };
+    // Checked before any token is minted: a pushed branch runs the repo's CI with its secrets.
+    const denied = protectedPaths(config, changes);
+    if (denied.length) return { outcome: "protected-paths", paths: denied };
     const resolution = await this.ctx.storage.get<RepoResolution>(repoKey(episode));
     const [owner = "", name = ""] = workspace.repo.split("/");
     const { alert } = episode;

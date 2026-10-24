@@ -57,6 +57,44 @@ export const DEFAULT_DATADOG_TOOLS = [
   "get_watchdog_story",
 ];
 
+/**
+ * Paths an Agent PR may never change (globs, case-insensitive; `**\/` = at any depth, `*` = within one path
+ * segment). Pushing a branch to the repo runs its CI with the repo's secrets, so a prompt-injected agent must not
+ * reach CI config, build entry points, scripts, dependency manifests or lockfiles, or ownership rules. A fix that
+ * touches any of them opens no Agent PR; the report lists them.
+ */
+export const DEFAULT_PROTECTED_PATHS = [
+  "**/.github/**",
+  "**/CODEOWNERS",
+  "**/.gitlab-ci.yml",
+  "**/Jenkinsfile",
+  "**/Makefile",
+  "**/Dockerfile*",
+  "**/docker-compose*",
+  "**/*.sh",
+  "**/scripts/**",
+  "**/package.json",
+  "**/package-lock.json",
+  "**/pnpm-lock.yaml",
+  "**/yarn.lock",
+  "**/go.sum",
+  "**/poetry.lock",
+  "**/Cargo.lock",
+  "**/Gemfile.lock",
+  "**/.npmrc",
+  "**/.gitmodules",
+  "**/.gitattributes",
+  "**/.husky/**",
+  "**/.pre-commit-config.yaml",
+  "**/wrangler.*",
+  "**/.devcontainer/**",
+  "**/tox.ini",
+  "**/setup.py",
+  "**/pyproject.toml",
+  "**/build.gradle*",
+  "**/pom.xml",
+];
+
 const ConfigSchema = z
   .object({
     orgs: z.array(OrgSchema).min(1),
@@ -68,6 +106,8 @@ const ConfigSchema = z
       appId: z.string().regex(/^\d+$/),
       /** Worker secret holding the App's private key as a PKCS#8 PEM (`openssl pkcs8 -topk8 -nocrypt -in app.pem`). */
       privateKeySecret: SecretName,
+      /** Paths an Agent PR may never change (see DEFAULT_PROTECTED_PATHS). */
+      protectedPaths: z.array(z.string().min(1)).default(DEFAULT_PROTECTED_PATHS),
     }),
     /** Report-only mode: `global`, overridden per Owning team where `teams` names it. */
     reportOnly: z

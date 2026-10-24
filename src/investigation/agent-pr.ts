@@ -21,6 +21,8 @@ export type AgentPrRecord =
   | { outcome: "report-only" }
   /** The agent declared a fix but changed no file. */
   | { outcome: "no-changes" }
+  /** The fix changes protected paths (CI, build, dependency or ownership files): nothing is pushed. */
+  | { outcome: "protected-paths"; paths: string[] }
   /** GitHub refused or kept failing; the report says so. */
   | { outcome: "failed"; reason: string };
 
@@ -28,6 +30,31 @@ export type AgentPrRecord =
 export function reportOnly(config: OncallConfig, tags: readonly string[]): boolean {
   const team = owningTeam(tags);
   return (team !== undefined ? config.reportOnly.teams[team] : undefined) ?? config.reportOnly.global;
+}
+
+/**
+ * The changed paths an Agent PR may not push (`config.github.protectedPaths`), matched case-insensitively against
+ * the path and every path below a leading `./`. A deleted file counts like a changed one.
+ */
+export function protectedPaths(config: OncallConfig, changes: readonly FileChange[]): string[] {
+  const patterns = config.github.protectedPaths.map(globRegExp);
+  return changes.map((c) => c.path).filter((path) => {
+    const normal = path.replace(/^(?:\.\/)+/, "").replace(/\/{2,}/g, "/");
+    return patterns.some((re) => re.test(normal));
+  });
+}
+
+/** A glob as a case-insensitive RegExp: `**\/` any leading directories, `**` anything, `*` and `?` within a segment. */
+function globRegExp(glob: string): RegExp {
+  const source = glob
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*\//g, "\u0001")
+    .replace(/\*\*/g, "\u0000")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]")
+    .replace(/\u0001/g, "(?:.*/)?")
+    .replace(/\u0000/g, ".*");
+  return new RegExp(`^${source}$`, "i");
 }
 
 /**

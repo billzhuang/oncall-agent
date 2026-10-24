@@ -121,7 +121,7 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
   const authErrors: string[] = [];
   const refWrites: RefWrite[] = [];
   const repos = new Map<string, RepoState>();
-  const holds: Array<{ method: string; path: RegExp; reached: () => void; released: Promise<void> }> = [];
+  const losses: Array<{ method: string; path: RegExp; reached: () => void }> = [];
   let nextPull = 1;
 
   /** What is wrong with an `Authorization: Bearer <installation token>` for a call needing `scope` at `level`. */
@@ -324,10 +324,11 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
         }
         const body = (text ? JSON.parse(text) : {}) as Record<string, any>;
         const response = repoRoute(`${owner}/${name}`, repo, request.method, route, url.searchParams, body);
-        const hold = holds.find((h) => h.method === request.method && h.path.test(url.pathname));
-        if (hold) {
-          hold.reached();
-          await hold.released;
+        const loss = losses.findIndex((l) => l.method === request.method && l.path.test(url.pathname));
+        if (loss >= 0) {
+          const [{ reached }] = losses.splice(loss, 1) as [(typeof losses)[number]];
+          reached();
+          throw new Error(`connection reset before GitHub's answer to ${request.method} ${url.pathname} arrived`);
         }
         return response;
       }
@@ -389,23 +390,14 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
       return repos.get(full.toLowerCase())?.pulls ?? [];
     },
     /**
-     * Holds the answer to the next matching repo call, its effect on the fake's state already applied, until the
-     * test releases it: a request GitHub carried out whose answer the Worker may never see.
+     * Loses the answer to the next matching repo call: GitHub carries it out (state applied), then the connection
+     * drops, so the Worker sees a network error. Poll `lost()` for it: a promise the Worker's side resolves and the
+     * test awaits crashes workerd ("Promise callback destroyed itself").
      */
-    hold(method: string, path: RegExp) {
-      let reached!: () => void;
-      let release!: () => void;
-      const wasReached = new Promise<void>((r) => (reached = r));
-      const released = new Promise<void>((r) => (release = r));
-      const hold = { method, path, reached, released };
-      holds.push(hold);
-      return {
-        reached: wasReached,
-        release: () => {
-          holds.splice(holds.indexOf(hold), 1);
-          release();
-        },
-      };
+    loseAnswer(method: string, path: RegExp) {
+      let lost = false;
+      losses.push({ method, path, reached: () => (lost = true) });
+      return { lost: () => lost };
     },
   };
 }
