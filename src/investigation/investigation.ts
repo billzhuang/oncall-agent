@@ -250,6 +250,21 @@ export class Investigation extends DurableObject<Env> {
     return !(await this.ctx.storage.get(abandonedKey(episode)));
   }
 
+  /**
+   * The Coordinator took back this Investigation's run slot at its hard cap, well past the time limit: stop the
+   * run (Partial). Does not wait for the abort, as the run may be wedged.
+   */
+  async overran(episodeNumber: number): Promise<void> {
+    await this.lifecycle.start();
+    const episode = await this.#episode();
+    if (!episode || episode.number !== episodeNumber || episode.status !== "Running") return;
+    const { budgets } = ports().config(this.env);
+    await this.#interruptFromRun({
+      status: "Partial",
+      reason: `time limit of ${budgets.investigationMinutes} minutes long passed and its run slot was taken back`,
+    });
+  }
+
   /** Queued -> Running, once the Coordinator granted a run slot: the agent's run, and the time limit. */
   async #begin(episode: Episode): Promise<void> {
     episode.status = "Running";
@@ -539,13 +554,20 @@ export class Investigation extends DurableObject<Env> {
   }
 
   /**
-   * A job gave up for good: hands back the run slot and reports the spend so far to the daily budget, so neither
-   * waits for a finish that may never come. Best effort: if the Coordinator cannot be reached either, its lease
-   * lapses and the up-front charge stands.
+   * A job gave up for good: stops the agent's run, then hands back the run slot and reports the spend so far to
+   * the daily budget, so neither waits for a finish that may never come. If the run cannot be confirmed stopped,
+   * or the Coordinator cannot be reached, the slot stays held (up to its hard cap) and the up-front charge stands.
    */
   async #abandon(): Promise<void> {
     const episode = await this.#episode();
     if (!episode || finished(episode.status)) return;
+    try {
+      await this.harness.abort();
+      if ((await this.harness.pending()).some((p) => p.operationId === operationId(episode))) return;
+    } catch (error) {
+      console.error(`Investigation ${this.lifecycle.name}: could not stop its run before giving up`, error);
+      return;
+    }
     await this.ctx.storage.put(abandonedKey(episode), true);
     try {
       await coordinatorStub(this.env).release(this.#ref(episode), (await this.#record(episode)).costUsd);

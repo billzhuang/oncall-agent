@@ -15,8 +15,9 @@ export interface InvestigationRef {
 /** The Coordinator's answer to an Investigation asking to run. */
 export type Admission = "granted" | "queued" | "budget-exhausted";
 
-/** A held run slot, leased until `leaseUntil` (business clock). */
+/** A held run slot, granted at `grantedAt` and leased until `leaseUntil` (business clock). */
 interface Slot extends InvestigationRef {
+  grantedAt: number;
   leaseUntil: number;
 }
 
@@ -31,10 +32,18 @@ const SLOTS = "run-slots";
 const QUEUE = "run-queue";
 /**
  * Slack past the Investigation time limit before a run slot's lease lapses: time to post the outcome and finish.
- * A lapsed lease is only a prompt to look: the Investigation stops its own run at the time limit (#4), so by
- * then it has normally finished; the slot is reclaimed only if the Investigation says it is no longer running.
+ * A lapsed lease is only a prompt to look: the Investigation stops its own run at the time limit (its deadline
+ * job and alarms), so by then it has normally finished. The slot is reclaimed if the Investigation says it no
+ * longer runs; while it says it still runs (or cannot answer) the lease is extended, up to the hard cap.
  */
-const LEASE_SLACK_MS = 15 * 60_000;
+const LEASE_SLACK_MS = 5 * 60_000;
+/** How far a lapsed lease is extended at a time while its Investigation still runs. */
+const LEASE_EXTENSION_MS = 5 * 60_000;
+/**
+ * Hard cap past the time limit, independent of what the Investigation says: the slot is taken back and the
+ * Investigation told to stop, so a stuck one cannot hold a run slot forever.
+ */
+const HARD_CAP_SLACK_MS = 15 * 60_000;
 /** Retry delay when a queued Investigation could not be told it may run. Real time: only a wake-up. */
 const DISPATCH_RETRY_MS = 5_000;
 
@@ -110,6 +119,11 @@ export class Coordinator extends DurableObject<Env> {
 
   async onJob({ job }: LifecycleJobContext): Promise<void> {
     if (job.fn === "dispatch") await this.#dispatch();
+    if (job.fn === "stop") {
+      // Throws if the Investigation cannot be reached, so Lifecycle retries the job.
+      const ref = job.payload as InvestigationRef;
+      await investigationStubByName(this.env, ref.name).overran(ref.episode);
+    }
   }
 
   /** Starts queued Investigations, oldest first, while run slots are free. */
@@ -142,7 +156,8 @@ export class Coordinator extends DurableObject<Env> {
   /** Takes a run slot for `ref` and charges the per-Investigation cap to today, once. */
   async #grant(ref: InvestigationRef): Promise<void> {
     const { slots } = await this.#state();
-    const slot: Slot = { name: ref.name, episode: ref.episode, leaseUntil: ports().now() + this.#leaseMs() };
+    const now = ports().now();
+    const slot: Slot = { name: ref.name, episode: ref.episode, grantedAt: now, leaseUntil: now + this.#timeLimitMs() + LEASE_SLACK_MS };
     await this.#putSlots([...slots.filter((s) => !same(s, ref)), slot]);
     if (await this.ctx.storage.get(chargeKey(ref))) return;
     const day = utcDay(ports().now());
@@ -163,15 +178,25 @@ export class Coordinator extends DurableObject<Env> {
   }
 
   /**
-   * Run slots whose lease lapsed: asks each Investigation whether it is still running. If so the lease is
-   * extended (the concurrency limit holds); if not, or it cannot answer, the slot is reclaimed. A reclaimed
-   * Investigation stays charged the cap, as it never reported its spend.
+   * Run slots whose lease lapsed. Past the hard cap the slot is taken back and the Investigation told to stop,
+   * whatever it says. Before that, each Investigation is asked whether it still runs: if so, or if it cannot
+   * answer, the lease is extended (the concurrency limit holds); if not, the slot is reclaimed. A reclaimed
+   * Investigation stays charged the cap until it reports its spend.
    */
   async #reclaimLapsed(): Promise<void> {
     const now = ports().now();
     const lapsed = (await this.#state()).slots.filter((s) => s.leaseUntil <= now);
     for (const slot of lapsed) {
-      let running = false;
+      const hardCap = slot.grantedAt + this.#timeLimitMs() + HARD_CAP_SLACK_MS;
+      if (now >= hardCap) {
+        console.warn(`Coordinator: Investigation ${slot.name}#${slot.episode} passed its run slot's hard cap; stopping it`);
+        const { slots } = await this.#state();
+        await this.#putSlots(slots.filter((s) => !same(s, slot)));
+        const ref: InvestigationRef = { name: slot.name, episode: slot.episode };
+        await this.lifecycle.jobs.push({ id: `stop:${slot.name}#${slot.episode}`, fn: "stop", payload: ref, time: Date.now() });
+        continue;
+      }
+      let running = true; // cannot answer: keep the slot and look again later, until the hard cap
       try {
         running = await investigationStubByName(this.env, slot.name).stillRunning(slot.episode);
       } catch (error) {
@@ -181,7 +206,8 @@ export class Coordinator extends DurableObject<Env> {
       const current = slots.find((s) => same(s, slot));
       if (!current || current.leaseUntil > now) continue;
       if (running) {
-        await this.#putSlots(slots.map((s) => (same(s, slot) ? { ...s, leaseUntil: ports().now() + this.#leaseMs() } : s)));
+        const leaseUntil = Math.min(ports().now() + LEASE_EXTENSION_MS, hardCap);
+        await this.#putSlots(slots.map((s) => (same(s, slot) ? { ...s, leaseUntil } : s)));
       } else {
         console.warn(`Coordinator: reclaimed the run slot of Investigation ${slot.name}#${slot.episode}, which never released it`);
         await this.#putSlots(slots.filter((s) => !same(s, slot)));
@@ -201,8 +227,9 @@ export class Coordinator extends DurableObject<Env> {
     };
   }
 
-  #leaseMs(): number {
-    return ports().config(this.env).budgets.investigationMinutes * 60_000 + LEASE_SLACK_MS;
+  /** The Investigation time limit from config. */
+  #timeLimitMs(): number {
+    return ports().config(this.env).budgets.investigationMinutes * 60_000;
   }
 
   #maxConcurrent(): number {

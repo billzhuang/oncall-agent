@@ -101,7 +101,7 @@ describe("Concurrency", () => {
     await vi.waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
   });
 
-  it("takes back the run slot of an Investigation stuck past its hard cap, stopping it with a failed message", async () => {
+  it("takes back the run slot of an Investigation stuck past its hard cap, stopping it (Partial)", async () => {
     fakes = installFakes({ config: { budgets: { ...BUDGETS, maxConcurrent: 1 } } });
     const alerts = Array.from({ length: 3 }, () => alertPayload());
     const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
@@ -114,7 +114,7 @@ describe("Concurrency", () => {
 
     await vi.waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
     await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
-    expect(fakes.teams.posts[0].text).toMatch(/^Investigation failed/);
+    expect(fakes.teams.posts[0].text).toMatch(/^Investigation partial/);
     expect(fakes.teams.posts[0].text).toContain(alerts[0].monitorId);
     expect(held.started).toHaveLength(2);
   });
