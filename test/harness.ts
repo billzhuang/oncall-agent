@@ -1,5 +1,11 @@
 import { env, exports } from "cloudflare:workers";
-import { abortAllDurableObjects, listDurableObjectIds, reset, runDurableObjectAlarm } from "cloudflare:test";
+import {
+  abortAllDurableObjects,
+  listDurableObjectIds,
+  reset,
+  runDurableObjectAlarm,
+  runInDurableObject,
+} from "cloudflare:test";
 import { parseConfig } from "../src/config";
 import { resetPorts, setPorts } from "../src/ports";
 import { fakeClock } from "./fakes/clock";
@@ -37,7 +43,25 @@ export type Fakes = ReturnType<typeof installFakes>;
 export async function cleanUp(): Promise<void> {
   await abortAllDurableObjects();
   await reset();
+  await wipeDurableObjects();
   resetPorts();
+}
+
+/**
+ * `reset()` leaves Durable Object storage in place under this plugin (verified: a value put before it is still
+ * there after it), so day-keyed state like the Coordinator's ledgers would leak between tests. Delete every
+ * object's storage and alarm directly, then drop the instances so none keeps stale in-memory state.
+ */
+async function wipeDurableObjects(): Promise<void> {
+  for (const ns of [env.INVESTIGATION, env.COORDINATOR] as DurableObjectNamespace[]) {
+    for (const id of await listDurableObjectIds(ns)) {
+      await runInDurableObject(ns.get(id), async (_instance, state) => {
+        await state.storage.deleteAlarm();
+        await state.storage.deleteAll();
+      });
+    }
+  }
+  await abortAllDurableObjects();
 }
 
 // ---- Driving the Worker's outer edge ----
