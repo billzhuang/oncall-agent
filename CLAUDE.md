@@ -19,3 +19,17 @@ Design only: no code, build, lint or test commands exist yet. When the Worker is
 - `agents`, `@earendil-works/pi-durable`, `@earendil-works/pi-ai` and `@cloudflare/computer` are pinned to exact versions.
 - Durable Objects use `jurisdiction: "eu"`. Datadog MCP is `https://mcp.datadoghq.eu/v1/mcp`, one connection per Org.
 - The GitHub repo is public: config references secrets by Worker-secret name only.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `billzhuang/oncall-agent`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`.
