@@ -50,7 +50,8 @@ export function reportMessage(alert: Alert, report: InvestigationReport, record:
       ...(report.evidence.length ? report.evidence.map((e) => `• ${e}`) : ["• (none gathered)"]),
       `Suspected cause: ${report.suspectedCause}`,
     ],
-    facts: [...episodeFacts(alert), ...recordFacts(record)],
+    facts: episodeFacts(alert),
+    measures: recordFacts(record),
     links: monitorLinks(alert),
   };
 }
@@ -60,7 +61,8 @@ export function failedMessage(alert: Alert, reason: string, record: Investigatio
   return {
     title: `Investigation failed: ${alertName(alert)}`,
     lines: [`Failed: ${reason}. Nothing was found or concluded; please investigate this alert yourself.`],
-    facts: [...episodeFacts(alert), ...recordFacts(record)],
+    facts: episodeFacts(alert),
+    measures: recordFacts(record),
     links: monitorLinks(alert),
   };
 }
