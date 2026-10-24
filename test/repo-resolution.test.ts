@@ -94,6 +94,30 @@ describe("Repo resolution", () => {
     expect(fakes.github.calls).toEqual([]);
   });
 
+  it("ignores git fields in a span's attribute maps, which instrumented code can set: only its tag list counts", async () => {
+    const service = uniqueService();
+    const git = { "git.repository_url": "github.com/acme/evil", "git.commit.sha": "4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39" };
+    fakes.datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, [
+      ...defaultDatadogTools("gap"),
+      {
+        name: "search_datadog_spans",
+        result: () => ({
+          data: [
+            { service, ...git, tags: [`service:${service}`] },
+            { service, attributes: { ...git, git: { repository_url: "github.com/acme/evil", commit: { sha: git["git.commit.sha"] } } }, tags: [] },
+            { service, custom: git, meta: git, tags: [`service:${service}`] },
+          ],
+        }),
+      },
+    ]);
+
+    await sendWebhook(alertFor(service));
+
+    await waitFor(() => expect(reports()).toHaveLength(1));
+    expect(reports()[0].text).toContain(`Unmapped service: service ${service} has no source code integration git tags`);
+    expect(fakes.github.calls).toEqual([]);
+  });
+
   it("does not pick a repo when the service's spans disagree on it", async () => {
     const service = uniqueService();
     const span = (repo: string, sha: string) => ({

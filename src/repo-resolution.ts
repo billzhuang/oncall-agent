@@ -91,7 +91,7 @@ interface GitTags {
 
 /**
  * The distinct git tags on the service's recent spans (empty when none carry them). Reads the tool result as
- * structured data and takes the tags only from each span's tag list or git attribute fields, by exact key, so
+ * structured data and takes the tags only from each span's reserved tag list, by exact key, so
  * text inside a span (a log line, an error message, a URL) can never name the repo.
  */
 async function gitTagsOf(datadog: DatadogConnection, service: string): Promise<GitTags[]> {
@@ -136,7 +136,12 @@ function spanList(value: unknown): unknown[] | undefined {
   return undefined;
 }
 
-/** A span's `git.repository_url` and `git.commit.sha`, from its tag list or git attribute fields only. */
+/**
+ * A span's `git.repository_url` and `git.commit.sha`, from its reserved tag list only: the tags source code
+ * integration sets. Attribute maps (`attributes`, `custom`, `meta`, top-level fields) are never read, since
+ * instrumented application code can write any key there. The real Datadog MCP result shape is still unverified,
+ * so this is the one function to adjust during the pilot.
+ */
 function spanGitTags(span: unknown): GitTags | undefined {
   if (!isFields(span)) return undefined;
   const fromTagList = (key: string) => {
@@ -147,21 +152,8 @@ function spanGitTags(span: unknown): GitTags | undefined {
     }
     return isFields(tags) ? tags[key] : undefined;
   };
-  const fromFields = (flat: string, nested: (git: Fields) => unknown) => {
-    for (const fields of [span, span.attributes, span.custom, span.meta]) {
-      if (!isFields(fields)) continue;
-      if (fields[flat] !== undefined) return fields[flat];
-      if (isFields(fields.git)) {
-        const value = nested(fields.git);
-        if (value !== undefined) return value;
-      }
-    }
-    return undefined;
-  };
-  const repositoryUrl = fromTagList("git.repository_url") ?? fromFields("git.repository_url", (git) => git.repository_url);
-  const sha =
-    fromTagList("git.commit.sha") ??
-    fromFields("git.commit.sha", (git) => (isFields(git.commit) ? git.commit.sha : git["commit.sha"]));
+  const repositoryUrl = fromTagList("git.repository_url");
+  const sha = fromTagList("git.commit.sha");
   if (typeof repositoryUrl !== "string" || typeof sha !== "string") return undefined;
   if (!repositoryUrl.trim() || !/^[0-9a-f]{7,40}$/i.test(sha.trim())) return undefined;
   return { repositoryUrl: repositoryUrl.trim(), sha: sha.trim().toLowerCase() };
