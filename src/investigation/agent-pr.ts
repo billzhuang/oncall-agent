@@ -17,7 +17,7 @@ export const BASE_BRANCH = "main";
 export type AgentPrRecord =
   /** A draft PR was opened, or the open one for this monitor group updated. */
   | { outcome: "opened" | "updated"; number: number; url: string; branch: string; drift: string[] }
-  /** The agent declared a fix, but Report-only mode is on for the Owning team (or globally). */
+  /** The agent declared a fix, but Report-only mode applies (globally, or the Owning team is not allowed Agent PRs). */
   | { outcome: "report-only" }
   /** The agent declared a fix but changed no file. */
   | { outcome: "no-changes" }

@@ -49,5 +49,5 @@ A draft pull request the agent opens when an Investigation traces the cause to s
 _Avoid_: Fix PR, auto-PR
 
 **Report-only mode**:
-A setting under which Investigations still produce Investigation reports but never open Agent PRs.
+The default for every Owning team: its Investigations produce Investigation reports but never open Agent PRs. A team leaves it only when it is explicitly allowed Agent PRs, and switching it on globally puts every team back in it.
 _Avoid_: Dry run, shadow mode
