@@ -58,11 +58,13 @@ export function fakeDatadogMcp() {
     return { data: [{ service, resource_name: "GET /checkout", tags: [`service:${service}`, "env:prod", ...gitTags] }] };
   };
   const requests: DatadogRequest[] = [];
+  let down = false;
   const service: FakeService = {
     async handle(request) {
       const token = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
       const path = new URL(request.url).pathname;
       requests.push({ token, path, method: request.method });
+      if (down) return new Response("service unavailable", { status: 503 });
       if (path !== MCP_PATH) return new Response("not found", { status: 404 });
       const tools = orgs.get(token);
       if (!tools) return new Response("unauthorized", { status: 401 });
@@ -117,6 +119,10 @@ export function fakeDatadogMcp() {
     /** Register an Org by its Service Access Token, with its canned tools (replacing any before). */
     org(token: string, tools: CannedTool[]) {
       orgs.set(token, tools);
+    },
+    /** Takes the whole Datadog MCP endpoint down (503 to everything) or brings it back. */
+    setDown(value: boolean) {
+      down = value;
     },
   };
 }

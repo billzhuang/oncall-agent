@@ -19,9 +19,12 @@ import {
   type AgentHost,
 } from "./agent";
 import {
+  MAX_EVIDENCE_LINES,
   boundedReport,
   budgetExhaustedMessage,
+  evidenceLine,
   failedMessage,
+  partialMessage,
   reportMessage,
   stoppedMessage,
   type InvestigationRecord,
@@ -63,7 +66,8 @@ const finished = (status: InvestigationStatus) => status !== "Queued" && status 
 
 /** Why the agent's run was interrupted, recorded durably before the run is aborted. */
 export interface Interruption {
-  status: Extract<FinishedStatus, "Stopped">;
+  /** Stopped (Recovered), or Partial (cost cap, time limit). */
+  status: Extract<FinishedStatus, "Stopped" | "Partial">;
   reason: string;
 }
 
@@ -83,6 +87,10 @@ const interruptedKey = (e: Episode) => `interrupted:${e.number}`;
 const freshContextKey = (e: Episode) => `fresh-context:${e.number}`;
 /** Set when a job gave up for good on this Alert episode (see `#abandon`). */
 const abandonedKey = (e: Episode) => `abandoned:${e.number}`;
+/** Set once the agent's one input was submitted. */
+const submittedKey = (e: Episode) => `submitted:${e.number}`;
+/** Evidence gathered by the agent's tools, one key per tool call so parallel and replayed calls never clash. */
+const evidencePrefix = (e: Episode) => `evidence:${e.number}:`;
 /** The episode's RepoResolution; when resolved it holds `{repoUrl, sha}`, the code the workspace (#7) reads. */
 const repoKey = (e: Episode) => `repo:${e.number}`;
 /** Whether the Coordinator granted this episode's reminder (decided once, so a retried run job keeps the answer). */
@@ -163,11 +171,30 @@ export class Investigation extends DurableObject<Env> {
    * Call from an RPC or `onAlarm`, or un-awaited from a hook: abort waits for the run to go idle.
    */
   private async interrupt(reason: Interruption): Promise<void> {
-    const episode = await this.#episode();
-    if (!episode || finished(episode.status)) return;
-    if (!(await this.ctx.storage.get(interruptedKey(episode)))) await this.ctx.storage.put(interruptedKey(episode), reason);
+    if ((await this.#flagInterruption(reason)) === "not-running") return;
     await this.harness.abort();
     await this.#scheduleFinalize();
+  }
+
+  /**
+   * `interrupt` for the run's own hooks and for alarms: records why, then aborts without waiting, since abort
+   * waits for the run to go idle. `#finalize` re-aborts if an eviction came between the flag and the abort.
+   */
+  async #interruptFromRun(reason: Interruption): Promise<void> {
+    if ((await this.#flagInterruption(reason)) !== "flagged") return; // one abort per run, not one per hook call
+    void this.harness
+      .abort()
+      .then(() => this.#scheduleFinalize())
+      .catch((error) => console.error(`Investigation ${this.lifecycle.name}: abort failed`, error));
+  }
+
+  /** Records why the run is interrupted; the first reason wins. */
+  async #flagInterruption(reason: Interruption): Promise<"flagged" | "already-flagged" | "not-running"> {
+    const episode = await this.#episode();
+    if (!episode || finished(episode.status)) return "not-running";
+    if (await this.ctx.storage.get(interruptedKey(episode))) return "already-flagged";
+    await this.ctx.storage.put(interruptedKey(episode), reason);
+    return "flagged";
   }
 
   /** Opens an Alert episode and starts its Investigation. */
@@ -223,9 +250,41 @@ export class Investigation extends DurableObject<Env> {
     return !(await this.ctx.storage.get(abandonedKey(episode)));
   }
 
+  /** Queued -> Running, once the Coordinator granted a run slot: the agent's run, and the time limit. */
+  async #begin(episode: Episode): Promise<void> {
+    episode.status = "Running";
+    episode.startedAt = ports().now();
+    await this.#save(episode);
+    // A durable job, not inline: it survives eviction, and keeps Datadog round trips out of the webhook.
+    await this.lifecycle.jobs.push({ id: "run", fn: "run", time: Date.now() });
+    // A wake-up at the time limit (real time), so the limit holds even if the run is wedged between alarms.
+    const { budgets } = ports().config(this.env);
+    await this.lifecycle.jobs.push({ id: "deadline", fn: "deadline", time: Date.now() + budgets.investigationMinutes * 60_000 });
+  }
+
+  /** Every alarm (pi's heartbeat while the agent runs, job wake-ups otherwise) checks the time limit. */
+  async onAlarm(): Promise<void> {
+    await this.#checkDeadline();
+  }
+
+  /** Past its time limit, a Running Investigation is stopped (Partial), whatever its run is doing. */
+  async #checkDeadline(): Promise<void> {
+    const episode = await this.#episode();
+    if (!episode || episode.status !== "Running" || episode.startedAt === undefined) return;
+    const { budgets } = ports().config(this.env);
+    if (ports().now() - episode.startedAt < budgets.investigationMinutes * 60_000) return;
+    if (!(await this.ctx.storage.get(submittedKey(episode)))) {
+      // The agent never got its input: the run job kept failing (e.g. Datadog MCP down). A crash, not a partial.
+      const limit = `it did not start within ${budgets.investigationMinutes} minutes`;
+      return this.#endWithoutReport(episode, await this.#runFailure(limit));
+    }
+    await this.#interruptFromRun({ status: "Partial", reason: `time limit of ${budgets.investigationMinutes} minutes reached` });
+  }
+
   async onJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
+    if (job.fn === "deadline") return this.#checkDeadline();
     if (job.fn === "admit") return this.#withBackoff(job.id, () => this.#admit());
-    if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run());
+    if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run(), () => this.#runGaveUp());
     if (job.fn === "finalize") return this.#withBackoff(job.id, () => this.#finalize());
     if (job.fn === "open-pending") return this.#withBackoff(job.id, () => this.#openPending());
   }
@@ -240,10 +299,7 @@ export class Investigation extends DurableObject<Env> {
       await this.#notify(episode, "budget", budgetExhaustedMessage(episode.alert));
       return this.#finish(episode, "Skipped", { costUsd: 0, durationMs: 0 }, "daily budget exhausted");
     }
-    episode.status = "Running";
-    episode.startedAt = ports().now();
-    await this.#save(episode);
-    await this.lifecycle.jobs.push({ id: "run", fn: "run", time: Date.now() });
+    await this.#begin(episode);
   }
 
   /** This Alert episode's Investigation, as the Coordinator knows it. */
@@ -278,7 +334,9 @@ export class Investigation extends DurableObject<Env> {
     if ((await this.ctx.storage.get(costBaselineKey(episode))) === undefined) {
       await this.ctx.storage.put(costBaselineKey(episode), await this.#spentUsd());
     }
+    if (await this.ctx.storage.get(interruptedKey(episode))) return this.#scheduleFinalize();
     await this.harness.submit(alertPrompt(episode.alert), { operationId: operationId(episode) });
+    await this.ctx.storage.put(submittedKey(episode), true);
     // After the submit, so a Teams outage delays only the reminder, not the agent.
     await this.#remind(episode, resolution);
     // Host jobs run only while pi is idle, so this looks once the run has ended (or at a heartbeat).
@@ -300,21 +358,49 @@ export class Investigation extends DurableObject<Env> {
     }
     const report = await this.ctx.storage.get<InvestigationReport>(reportKey(episode));
     // A report submitted before the interruption landed wins: the agent had finished its work.
-    if (!report && interruption) {
-      const record = await this.#record(episode);
-      await this.#notify(episode, "stopped", stoppedMessage(episode.alert, record));
-      return this.#finish(episode, interruption.status, record, interruption.reason);
-    }
+    if (!report && interruption) return this.#endInterrupted(episode, interruption);
     if (!report) return this.#endWithoutReport(episode, await this.#runEndReason(episode));
     const record = await this.#record(episode);
     await this.#notify(episode, "report", reportMessage(episode.alert, report, record, await this.#codeLine(episode)));
     await this.#finish(episode, "Completed", record);
   }
 
+  /**
+   * The run was interrupted before it submitted a report: posts the stopped on recovery note, or (cost cap,
+   * time limit) the partial message with the evidence gathered so far, and finishes the Investigation.
+   */
+  async #endInterrupted(episode: Episode, interruption: Interruption): Promise<void> {
+    const record = await this.#record(episode);
+    if (interruption.status === "Stopped") {
+      await this.#notify(episode, "stopped", stoppedMessage(episode.alert, record));
+      return this.#finish(episode, "Stopped", record, interruption.reason);
+    }
+    const evidence = await this.ctx.storage.list<{ at: number; line: string }>({ prefix: evidencePrefix(episode) });
+    const lines = [...evidence.values()]
+      .sort((a, b) => a.at - b.at)
+      .slice(0, MAX_EVIDENCE_LINES)
+      .map((e) => e.line);
+    await this.#notify(episode, "partial", partialMessage(episode.alert, interruption.reason, lines, record));
+    await this.#finish(episode, "Partial", record, interruption.reason);
+  }
+
   async #endWithoutReport(episode: Episode, reason: string): Promise<void> {
     const record = await this.#record(episode);
     await this.#notify(episode, "failed", failedMessage(episode.alert, reason, record, await this.#codeLine(episode)));
     await this.#finish(episode, "Failed", record, reason);
+  }
+
+  /** The run job kept failing: the Investigation could not start its agent, so it ends Failed. */
+  async #runGaveUp(): Promise<void> {
+    const episode = await this.#episode();
+    if (!episode || episode.status !== "Running" || (await this.ctx.storage.get(submittedKey(episode)))) return;
+    await this.#endWithoutReport(episode, await this.#runFailure("it kept failing"));
+  }
+
+  /** Why the agent could not be started, in words for the failed message, with the last error seen. */
+  async #runFailure(what: string): Promise<string> {
+    const error = await this.ctx.storage.get<string>("last-error:run");
+    return `the Investigation could not start its agent: ${what}${error ? ` (last error: ${error.slice(0, 300)})` : ""}`;
   }
 
   /** Repo resolution for this Alert episode, done once by the harness (not the model) before the agent starts. */
@@ -379,6 +465,7 @@ export class Investigation extends DurableObject<Env> {
     // looks unfinished. Release is idempotent and the Coordinator counts the spend once.
     await coordinatorStub(this.env).release(this.#ref(current), record.costUsd);
     await this.#save(current);
+    await this.lifecycle.jobs.cancel("deadline");
     await this.datadog.close();
     console.log(
       JSON.stringify({
@@ -427,17 +514,26 @@ export class Investigation extends DurableObject<Env> {
   async #withBackoff(
     jobId: string,
     work: () => Promise<void | { rescheduleAt: number }>,
+    gaveUp?: () => Promise<void>,
   ): Promise<void | { rescheduleAt: number }> {
     const key = `failures:${jobId}`;
     try {
       const outcome = await work();
-      await this.ctx.storage.delete(key);
+      await this.ctx.storage.delete([key, `last-error:${jobId}`]);
       return outcome;
     } catch (error) {
       const failures = ((await this.ctx.storage.get<number>(key)) ?? 0) + 1;
       await this.ctx.storage.put(key, failures);
+      await this.ctx.storage.put(`last-error:${jobId}`, error instanceof Error ? error.message : String(error));
       console.error(`Investigation ${this.lifecycle.name}: job ${jobId} failed (${failures})`, error);
-      if (failures >= MAX_JOB_FAILURES) return this.#abandon(); // give up; #4 reports Failed investigations
+      if (failures >= MAX_JOB_FAILURES) {
+        try {
+          await gaveUp?.();
+        } finally {
+          await this.#abandon();
+        }
+        return;
+      }
       return { rescheduleAt: Date.now() + Math.min(1_000 * 2 ** (failures - 1), 5 * 60_000) };
     }
   }
@@ -492,6 +588,23 @@ export class Investigation extends DurableObject<Env> {
         if (await storage.get(key)) return false;
         await storage.put(key, true);
         return true;
+      },
+      guardrails: async () => {
+        const episode = await this.#episode();
+        if (!episode || episode.status !== "Running") return undefined;
+        const { budgets } = ports().config(this.env);
+        return {
+          startedAt: episode.startedAt ?? episode.openedAt,
+          spentUsd: (await this.#record(episode)).costUsd,
+          maxUsd: budgets.investigationUsd,
+          maxMinutes: budgets.investigationMinutes,
+        };
+      },
+      interrupt: (reason) => this.#interruptFromRun({ status: "Partial", reason }),
+      evidenceGathered: async (callId, tool, text) => {
+        const key = `${evidencePrefix(await current())}${callId}`;
+        if (await storage.get(key)) return;
+        await storage.put(key, { at: ports().now(), line: evidenceLine(tool, text) });
       },
     };
   }
