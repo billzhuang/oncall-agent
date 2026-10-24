@@ -66,6 +66,13 @@ export type TriggerOutcome = "opened" | "joined" | "duplicate";
 /** What a Recovered did: stopped the running Investigation, only closed the Alert episode, or nothing. */
 export type RecoverOutcome = "stopped" | "closed" | "ignored" | "duplicate";
 
+/** A Teams message of one kind for one Alert episode: meant to be sent (intent), and sent once Teams accepted it. */
+interface OutboxEntry {
+  intentAt: number;
+  sentAt?: number;
+  channel: string;
+}
+
 type FinishedStatus = Exclude<InvestigationStatus, "Queued" | "Running">;
 const finished = (status: InvestigationStatus) => status !== "Queued" && status !== "Running";
 
@@ -290,7 +297,7 @@ export class Investigation extends DurableObject<Env> {
 
   /** Every alarm (pi's heartbeat while the agent runs, job wake-ups otherwise) checks the time limit. */
   async onAlarm(): Promise<void> {
-    await this.#checkDeadline();
+    await this.#serially("deadline", () => this.#checkDeadline());
   }
 
   /** Past its time limit, a Running Investigation is stopped (Partial), whatever its run is doing. */
@@ -307,7 +314,29 @@ export class Investigation extends DurableObject<Env> {
     await this.#interruptFromRun({ status: "Partial", reason: `time limit of ${budgets.investigationMinutes} minutes reached` });
   }
 
-  async onJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
+  /**
+   * Lifecycle may drive the same job from two overlapping alarm invocations (jobs are not single-flight by
+   * default), and outward work awaits the network, so two runs of `finalize` could both find the outbox empty.
+   * Each job function therefore runs one at a time in this instance; a second invocation waits for the first.
+   */
+  #jobRuns = new Map<string, Promise<unknown>>();
+
+  async onJob(context: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
+    return this.#serially(context.job.fn, () => this.#runJob(context));
+  }
+
+  /** Runs `work` after any earlier work under the same key in this instance has settled. */
+  async #serially<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const run = (this.#jobRuns.get(key) ?? Promise.resolve()).catch(() => undefined).then(work);
+    this.#jobRuns.set(key, run);
+    try {
+      return await run;
+    } finally {
+      if (this.#jobRuns.get(key) === run) this.#jobRuns.delete(key);
+    }
+  }
+
+  async #runJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
     if (job.fn === "deadline") return this.#checkDeadline();
     if (job.fn === "admit") return this.#withBackoff(job.id, () => this.#admit());
     if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run(), () => this.#runGaveUp());
@@ -675,13 +704,21 @@ export class Investigation extends DurableObject<Env> {
     }
   }
 
-  /** Sends a Teams message at most once per Alert episode and kind: check the outbox, send, record. */
+  /**
+   * Sends a Teams message once per Alert episode and kind, at least once: records the intent, sends, then marks it
+   * sent. Teams webhooks take no idempotency key, so a crash or a lost answer between the send and the mark leaves
+   * an intent without `sentAt`, and the replay sends again (a possible duplicate, never a lost message).
+   */
   async #notify(episode: Episode, kind: TeamsMessageKind, message: TeamsMessage): Promise<void> {
     const key = `outbox:${episode.number}:${kind}`;
-    if (await this.ctx.storage.get(key)) return;
+    const entry = await this.ctx.storage.get<OutboxEntry>(key);
+    if (entry?.sentAt !== undefined) return;
+    if (entry) console.warn(`Investigation ${this.lifecycle.name}: sending the ${kind} message again; Teams may show it twice`);
     const channel = teamsChannelSecret(ports().config(this.env), episode.alert.org, episode.alert.tags);
+    const intent: OutboxEntry = { intentAt: ports().now(), channel };
+    await this.ctx.storage.put(key, intent);
     await postToTeams(this.env, channel, message);
-    await this.ctx.storage.put(key, { sentAt: ports().now(), channel });
+    await this.ctx.storage.put(key, { ...intent, sentAt: ports().now() } satisfies OutboxEntry);
   }
 
   /** What the agent (agent.ts) may use of this Investigation. */

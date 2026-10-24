@@ -6,7 +6,7 @@ import {
   runDurableObjectAlarm,
   runInDurableObject,
 } from "cloudflare:test";
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
 import { parseConfig } from "../src/config";
 import { investigationStub } from "../src/durable";
 import { resetPorts, setPorts } from "../src/ports";
@@ -171,4 +171,22 @@ export async function settle(): Promise<void> {
     await new Promise((r) => setTimeout(r, 50));
     if (!ran) return;
   }
+}
+
+/**
+ * "Evicted before it retried", deterministically: call with Teams failing every post (`teams.fail(1_000_000)`).
+ * Waits for a refused post, evicts every Durable Object, heals Teams, then drives the Investigation's alarm until
+ * something is posted. No post can land between the refusal and the eviction.
+ */
+export async function evictedWhileTeamsDown(fakes: Fakes, alert: { orgId: string; monitorId: string; group: string }) {
+  await waitFor(() => expect(fakes.teams.refused()).toBeGreaterThan(0));
+  await abortAllDurableObjects();
+  fakes.teams.fail(0);
+  await waitFor(
+    async () => {
+      await runDurableObjectAlarm(investigationOf(alert));
+      expect(fakes.teams.posts.length).toBeGreaterThan(0);
+    },
+    { interval: 200 },
+  );
 }

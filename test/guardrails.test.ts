@@ -1,6 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { abortAllDurableObjects, runDurableObjectAlarm } from "cloudflare:test";
-import { alertPayload, cleanUp, gate, installFakes, investigationOf, sendWebhook, settle, type Fakes, waitFor } from "./harness";
+import {
+  alertPayload,
+  cleanUp,
+  evictedWhileTeamsDown,
+  gate,
+  installFakes,
+  investigationOf,
+  sendWebhook,
+  settle,
+  type Fakes,
+  waitFor,
+} from "./harness";
 import { TEST_SECRETS } from "./config";
 import { toolCall, type Script } from "./fakes/model";
 
@@ -124,19 +135,12 @@ describe("Once across replays", () => {
     fakes = installFakes({ costPerMTok: EXPENSIVE });
     withoutCode(fakes);
     fakes.model.script(keepsSearching);
-    fakes.teams.fail(1);
+    fakes.teams.fail(1_000_000);
     const alert = alertPayload();
     await sendWebhook(alert);
-    await waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
 
-    await abortAllDurableObjects();
-    await waitFor(
-      async () => {
-        await runDurableObjectAlarm(investigationOf(alert));
-        expect(fakes.teams.posts).toHaveLength(1);
-      },
-      { interval: 250 },
-    );
+    await evictedWhileTeamsDown(fakes, alert);
+    expect(fakes.teams.posts).toHaveLength(1);
     expect(fakes.teams.posts[0].text).toMatch(/cost cap/i);
     const requests = fakes.model.requests.length;
 

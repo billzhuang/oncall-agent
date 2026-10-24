@@ -10,20 +10,30 @@ export interface TeamsPost {
   text: string;
 }
 
-/** Records every post to `teams.test`. `fail(n)` makes the next n posts answer 500. */
+/**
+ * Records every post to `teams.test`. `fail(n)` makes the next n posts answer 500 (`fail(0)` heals it);
+ * `loseAnswer()` makes Teams accept the next post but the connection drop before its answer arrives.
+ */
 export function fakeTeams() {
   const posts: TeamsPost[] = [];
   let failures = 0;
+  let refused = 0;
+  let loseNext = false;
   const service: FakeService = {
     async handle(request) {
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       if (failures > 0) {
         failures--;
+        refused++;
         return new Response("teams unavailable", { status: 500 });
       }
       const body = await request.json();
       const url = request.url;
       posts.push({ url, channel: new URL(url).pathname.split("/").filter(Boolean).at(-1) ?? "", body, text: cardText(body) });
+      if (loseNext) {
+        loseNext = false;
+        throw new Error("connection reset before Teams' answer arrived");
+      }
       return new Response(null, { status: 202 });
     },
   };
@@ -34,6 +44,11 @@ export function fakeTeams() {
     to: (channel: string) => posts.filter((p) => p.channel === channel),
     fail(n: number) {
       failures = n;
+    },
+    /** How many posts were refused with a 500 so far. */
+    refused: () => refused,
+    loseAnswer() {
+      loseNext = true;
     },
   };
 }

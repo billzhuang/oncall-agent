@@ -3,6 +3,7 @@ import { abortAllDurableObjects, runDurableObjectAlarm } from "cloudflare:test";
 import {
   alertPayload,
   cleanUp,
+  evictedWhileTeamsDown,
   gate,
   installFakes,
   investigationOf,
@@ -191,21 +192,40 @@ describe("Eviction", () => {
   });
 
   it("does not post the report twice when Teams fails and the Investigation is evicted before it retries", async () => {
-    fakes.teams.fail(1);
+    fakes.teams.fail(1_000_000);
     const alert = alertPayload();
     await sendWebhook(alert);
-    await waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
 
-    await abortAllDurableObjects();
-    await waitFor(
-      async () => {
-        await runDurableObjectAlarm(investigationOf(alert));
-        expect(fakes.teams.posts).toHaveLength(1);
-      },
-      { interval: 250 },
-    );
+    await evictedWhileTeamsDown(fakes, alert);
+
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.teams.posts[0].text).toContain("Investigation report:");
+  });
+
+  it("posts the failed message once when Teams fails and the Investigation is evicted before it retries", async () => {
+    fakes.model.script(() => text("I give up."));
+    fakes.teams.fail(1_000_000);
+    const alert = alertPayload();
+    await sendWebhook(alert);
+
+    await evictedWhileTeamsDown(fakes, alert);
+
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.teams.posts[0].text).toMatch(/^Investigation failed/);
+  });
+
+  it("sends a message again when Teams took it but its answer was lost: posting is at-least-once", async () => {
+    fakes.teams.loseAnswer();
+    const alert = alertPayload();
+
+    await sendWebhook(alert);
+
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(2);
+    expect(fakes.teams.posts.map((p) => p.text)).toEqual([fakes.teams.posts[0].text, fakes.teams.posts[0].text]);
   });
 });
 

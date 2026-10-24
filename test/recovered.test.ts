@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runDurableObjectAlarm } from "cloudflare:test";
-import { alertPayload, cleanUp, gate, installFakes, investigationOf, sendWebhook, settle, uniqueMonitorId, type Fakes, waitFor } from "./harness";
+import { alertPayload, cleanUp, evictedWhileTeamsDown, gate, installFakes, investigationOf, sendWebhook, settle, uniqueMonitorId, type Fakes, waitFor } from "./harness";
 import { TEST_SECRETS } from "./config";
 
 let fakes: Fakes;
@@ -107,6 +107,23 @@ describe("Recovered", () => {
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
     expect(fakes.teams.posts[0].text).toContain("Investigation report:");
+  });
+
+  it("posts the note once when Teams fails and the Investigation is evicted before it retries", async () => {
+    const datadog = holdDatadog();
+    const monitorId = uniqueMonitorId();
+    const triggered = alertPayload({ monitorId });
+    await sendWebhook(triggered);
+    await waitFor(() => expect(datadog.searches()).toBe(1));
+    fakes.teams.fail(1_000_000);
+
+    await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
+    await evictedWhileTeamsDown(fakes, triggered);
+
+    datadog.release();
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.teams.posts[0].text).toMatch(/stopped/i);
   });
 
   it("posts the note once when Teams fails at first", async () => {
