@@ -152,6 +152,28 @@ describe("Teams messages are plain text", () => {
     expect(raw).toContain("раураl[.]com");
   });
 
+  it("defangs a dot hidden between zero-width or soft-hyphen characters", async () => {
+    fakes.model.script(
+      investigate({
+        report: () => ({
+          whatFired: "Visit evil​.com or evil.‍com now",
+          evidence: ["Joiner evil⁠.﻿com, soft hyphen evil­.com and ev­il.example"],
+          suspectedCause: "unknown",
+        }),
+      }),
+    );
+
+    await sendWebhook(alertPayload());
+
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    const raw = cardBodyText(fakes.teams.posts[0].body);
+    // Teams may drop invisible characters: no dot may sit between letters with only ignorable characters around it.
+    expect(raw).not.toMatch(/\p{L}[\p{Cf}\p{Default_Ignorable_Code_Point}]*\.[\p{Cf}\p{Default_Ignorable_Code_Point}]*\p{L}/u);
+    expect(raw).not.toMatch(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/u);
+    expect(raw).toContain("evil[.]com");
+    expect(raw).toContain("evil[.]example");
+  });
+
   it("defangs bare URLs and <url> autolinks in the alert title", async () => {
     const alert = alertPayload({ title: "[Triggered] see https://evil.example/x or <https://evil.example/y> www.evil.example" });
 

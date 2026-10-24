@@ -69,6 +69,8 @@ const SCHEME_URL = /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s<>"']*|\b(?:mailto|tel|sms|
  * TLD allowlist: version numbers and dotted identifiers read `1[.]2[.]3`, an accepted cost.
  */
 const LABEL_DOT = /(?<=[\p{L}\p{N}\p{M}_-]\\?)\.(?=\\?[\p{L}\p{N}\p{M}_-])/gu;
+/** Format and default-ignorable characters: invisible, and dropped by some renderers and by IDNA. */
+const INVISIBLE = /[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
 /**
  * Characters a linkifier or IDNA may read as a dot, left after NFKC folding (which already maps the fullwidth,
  * small and one-dot-leader forms to `.`): ideographic and halfwidth ideographic full stops, and other lookalikes.
@@ -98,7 +100,10 @@ function defang(text: string): string {
  */
 export function plain(text: string): string {
   // NFKC first: fullwidth and other compatibility forms (`ｅｖｉｌ．ｃｏｍ`) become the ASCII a linkifier would see.
-  return defang(escapeMarkdown(text.normalize("NFKC").replace(DOT_LOOKALIKES, ".")));
+  // Then drop invisible characters (zero-width spaces and joiners, soft hyphens, BOM): a renderer may strip them,
+  // so one next to a dot (`evil​.com`) must not hide the dot from the defanging below.
+  const visible = text.normalize("NFKC").replace(INVISIBLE, "");
+  return defang(escapeMarkdown(visible.replace(DOT_LOOKALIKES, ".")));
 }
 
 function escapeMarkdown(text: string): string {
