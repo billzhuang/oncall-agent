@@ -208,6 +208,7 @@ export class Coordinator extends DurableObject<Env> {
       if (running) {
         const leaseUntil = Math.min(ports().now() + LEASE_EXTENSION_MS, hardCap);
         await this.#putSlots(slots.map((s) => (same(s, slot) ? { ...s, leaseUntil } : s)));
+        console.log(JSON.stringify({ event: "coordinator.lease-extended", investigation: slot.name, episode: slot.episode, leaseUntil }));
       } else {
         console.warn(`Coordinator: reclaimed the run slot of Investigation ${slot.name}#${slot.episode}, which never released it`);
         await this.#putSlots(slots.filter((s) => !same(s, slot)));

@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { alertPayload, cleanUp, installFakes, sendWebhook, settle, uniqueMonitorId, type Fakes } from "./harness";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { alertPayload, cleanUp, installFakes, sendWebhook, settle, uniqueMonitorId, type Fakes, waitFor } from "./harness";
 import { TEST_SECRETS } from "./config";
 import { defaultDatadogTools } from "./fakes/datadog-mcp";
 
@@ -34,7 +34,7 @@ describe("Repo resolution", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const [report] = reports();
     expect(report.text).toContain(`acme/${service}`);
     expect(report.text).toContain(sha);
@@ -61,7 +61,7 @@ describe("Repo resolution", () => {
 
     await sendWebhook(alertFor(service, { extraTags: [`repo:acme/${service}`, `git.repository_url:github.com/acme/${service}`] }));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(reports()[0].text).toContain("Unmapped service");
     expect(fakes.github.calls).toEqual([]);
   });
@@ -88,7 +88,7 @@ describe("Repo resolution", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(reports()[0].text).toContain(`Unmapped service: service ${service} has no source code integration git tags`);
     expect(reports()[0].text).not.toContain("acme/evil at");
     expect(fakes.github.calls).toEqual([]);
@@ -107,7 +107,7 @@ describe("Repo resolution", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(reports()[0].text).toContain("Unmapped service");
     expect(reports()[0].text).toContain("disagree");
     expect(reports()[0].text).not.toContain("at deployed commit");
@@ -123,7 +123,7 @@ describe("Repo resolution", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(reports()[0].text).toContain("Code: not read");
     await settle();
     expect(fakes.teams.posts).toHaveLength(1); // no reminder: nothing is known to be missing
@@ -137,7 +137,7 @@ describe("Unmapped service", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     const [report] = reports();
     expect(report.channel).toBe("sre");
     expect(report.text).toContain(`Unmapped service: service ${service} has no source code integration git tags`);
@@ -158,23 +158,23 @@ describe("Unmapped service", () => {
     const reminders = () => fakes.teams.posts.filter((p) => p.text.includes(`Unmapped service: ${service}`));
 
     await sendWebhook(alertFor(service));
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
 
     fakes.clock.advance(days(6));
     await sendWebhook(alertFor(service)); // another monitor of the same service
-    await vi.waitFor(() => expect(reports()).toHaveLength(2));
+    await waitFor(() => expect(reports()).toHaveLength(2));
     await settle();
     expect(reminders()).toHaveLength(1);
 
     await sendWebhook(alertFor(service, { org: "wk" })); // the same service in another Org
-    await vi.waitFor(() => expect(reports()).toHaveLength(3));
+    await waitFor(() => expect(reports()).toHaveLength(3));
     await settle();
     expect(reminders()).toHaveLength(2);
 
     fakes.clock.advance(days(1));
     await sendWebhook(alertFor(service));
-    await vi.waitFor(() => expect(reports()).toHaveLength(4));
-    await vi.waitFor(() => expect(reminders()).toHaveLength(3));
+    await waitFor(() => expect(reports()).toHaveLength(4));
+    await waitFor(() => expect(reminders()).toHaveLength(3));
     await settle();
     expect(reminders()).toHaveLength(3);
   });
@@ -188,7 +188,7 @@ describe("Repo not enabled", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     const [report] = reports();
     expect(report.text).toContain(`repo not enabled: the GitHub App is not installed on ${repo}`);
     const [reminder] = fakes.teams.posts.filter((p) => p !== report);
@@ -208,7 +208,7 @@ describe("Repo not enabled", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     for (const post of fakes.teams.posts) {
       expect(post.text).not.toMatch(/s3cretpass|deploy:|private_token|tok123|frag456/);
     }
@@ -228,15 +228,15 @@ describe("Repo not enabled", () => {
     const reminders = () => fakes.teams.posts.filter((p) => p.text.includes(`Repo not enabled: ${repo}`));
 
     await sendWebhook(alertFor(first));
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     await sendWebhook(alertFor(second));
-    await vi.waitFor(() => expect(reports()).toHaveLength(2));
+    await waitFor(() => expect(reports()).toHaveLength(2));
     await settle();
     expect(reminders()).toHaveLength(1);
 
     fakes.clock.advance(days(7));
     await sendWebhook(alertFor(second));
-    await vi.waitFor(() => expect(reminders()).toHaveLength(2));
+    await waitFor(() => expect(reminders()).toHaveLength(2));
   });
 
   it("treats a repo as enabled once the GitHub App is installed on it (selected repos)", async () => {
@@ -247,7 +247,7 @@ describe("Repo not enabled", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(reports()[0].text).toContain(`${owner}/${service} at deployed commit abcdef1`);
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);

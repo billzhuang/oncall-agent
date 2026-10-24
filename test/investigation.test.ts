@@ -9,6 +9,7 @@ import {
   sendWebhook,
   settle,
   type Fakes,
+  waitFor,
 } from "./harness";
 import { TEST_SECRETS } from "./config";
 import { DATADOG_WRITE_TOOLS } from "./fakes/datadog-mcp";
@@ -56,7 +57,7 @@ describe("Investigation report", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(post.channel).toBe("sre");
     expect(post.text).toContain("Error rate on checkout above 5%");
@@ -99,7 +100,7 @@ describe("Teams messages are plain text", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(actionUrls(post.body)).toEqual([alert.link]);
     expectInert(cardBodyText(post.body));
@@ -120,7 +121,7 @@ describe("Teams messages are plain text", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const raw = cardBodyText(fakes.teams.posts[0].body);
     expect(raw).not.toMatch(/evil\.support|evil\.zone|login\.evil/);
     expect(raw).not.toMatch(/[。．｡]/);
@@ -133,7 +134,7 @@ describe("Teams messages are plain text", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(actionUrls(post.body)).toEqual([alert.link]);
     expectInert(cardBodyText(post.body));
@@ -156,16 +157,16 @@ describe("Eviction", () => {
     ]);
     const alert = alertPayload();
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(searches).toBe(1));
+    await waitFor(() => expect(searches).toBe(1));
 
     await abortAllDurableObjects(); // evicted while the Datadog call is in flight
     held.open();
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await runDurableObjectAlarm(investigationOf(alert));
         expect(fakes.teams.posts).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 200 },
+      { interval: 200 },
     );
 
     expect(fakes.teams.posts[0].text).toContain("OutOfMemoryError in checkout-worker");
@@ -177,7 +178,7 @@ describe("Eviction", () => {
   it("does not post the report again or rerun the agent after an eviction that follows it", async () => {
     const alert = alertPayload();
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     await settle();
     const modelRequests = fakes.model.requests.length;
 
@@ -193,15 +194,15 @@ describe("Eviction", () => {
     fakes.teams.fail(1);
     const alert = alertPayload();
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
 
     await abortAllDurableObjects();
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await runDurableObjectAlarm(investigationOf(alert));
         expect(fakes.teams.posts).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 250 },
+      { interval: 250 },
     );
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
@@ -222,7 +223,7 @@ describe("Run ending without a report", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].text).toContain("The database is slow");
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
@@ -234,13 +235,13 @@ describe("Run ending without a report", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(post.channel).toBe("sre");
     expect(post.text).toMatch(/failed/i);
     expect(post.text).not.toContain("Investigation report:");
     expect(fakes.model.requests).toHaveLength(2); // told once to submit, then it ends
-    await vi.waitFor(() => expect(finishedRecords(log)).toMatchObject([{ status: "Failed" }]));
+    await waitFor(() => expect(finishedRecords(log)).toMatchObject([{ status: "Failed" }]));
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
   });
@@ -252,7 +253,7 @@ describe("Model", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.model.requests.length).toBeGreaterThan(0);
     expect(new Set(fakes.model.requests.map((r) => r.modelId))).toEqual(new Set(["@cf/acme/other-model-2"]));
   });
@@ -262,7 +263,7 @@ describe("Model", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const prompt = textOf(fakes.model.requests[0].messages.find((m) => m.role === "user")?.content);
     expect(prompt).toContain("p99 latency on search-api");
     expect(prompt).toContain(alert.monitorId);
@@ -286,11 +287,11 @@ describe("Investigation record", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const report = fakes.teams.posts[0].text;
     expect(report).toContain("4m 0s");
     expect(report).toMatch(/\$0\.\d\d/);
-    await vi.waitFor(() => expect(finishedRecords(log)).toHaveLength(1));
+    await waitFor(() => expect(finishedRecords(log)).toHaveLength(1));
     const [record] = finishedRecords(log);
     expect(record).toMatchObject({ status: "Completed", monitorId: alert.monitorId, org: "gap", durationMs: minutes(4) });
     expect(record.costUsd).toBeGreaterThan(0);
@@ -304,7 +305,7 @@ describe("Datadog MCP per Org", () => {
     await sendWebhook(alertPayload({ org: "gap", tags }));
     await sendWebhook(alertPayload({ org: "wk", tags }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     const [gap] = fakes.teams.to("gap-default");
     const [wk] = fakes.teams.to("wk-default");
     expect(gap.text).toContain("gap: NullPointerException");
@@ -319,7 +320,7 @@ describe("Datadog MCP per Org", () => {
   it("offers the agent no Datadog write tools", async () => {
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const offered = fakes.model.requests[0].tools;
     expect(offered).toEqual(
       expect.arrayContaining(["datadog_search_datadog_logs", "datadog_get_datadog_metric", "submit_report"]),
@@ -332,7 +333,7 @@ describe("Datadog MCP per Org", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.datadog.calls.filter((c) => DATADOG_WRITE_TOOLS.includes(c.tool))).toEqual([]);
   });
 
@@ -345,7 +346,7 @@ describe("Datadog MCP per Org", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const offered = fakes.model.requests[0].tools;
     expect(offered.filter((t) => t.startsWith("datadog_"))).toEqual(["datadog_search_datadog_logs"]);
     expect(offered).toContain("submit_report");

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runDurableObjectAlarm } from "cloudflare:test";
-import { alertPayload, cleanUp, gate, installFakes, investigationOf, sendWebhook, settle, uniqueMonitorId, type Fakes } from "./harness";
+import { alertPayload, cleanUp, gate, installFakes, investigationOf, sendWebhook, settle, uniqueMonitorId, type Fakes, waitFor } from "./harness";
 import { TEST_SECRETS } from "./config";
 
 let fakes: Fakes;
@@ -41,12 +41,12 @@ function holdDatadog() {
 
 /** Runs the Investigation's due alarms until `check` passes (a finalize may wait for the run to settle). */
 async function untilPosted(alert: ReturnType<typeof alertPayload>, n: number) {
-  await vi.waitFor(
+  await waitFor(
     async () => {
       await runDurableObjectAlarm(investigationOf(alert));
       expect(fakes.teams.posts).toHaveLength(n);
     },
-    { timeout: 15_000, interval: 200 },
+    { interval: 200 },
   );
 }
 
@@ -57,7 +57,7 @@ describe("Recovered", () => {
     const monitorId = uniqueMonitorId();
     const triggered = alertPayload({ monitorId });
     await sendWebhook(triggered);
-    await vi.waitFor(() => expect(datadog.searches()).toBe(1));
+    await waitFor(() => expect(datadog.searches()).toBe(1));
 
     const res = await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
 
@@ -68,7 +68,7 @@ describe("Recovered", () => {
     expect(note.text).toMatch(/stopped/i);
     expect(note.text).toMatch(/recovered/i);
     expect(note.text).not.toContain("Investigation report:");
-    await vi.waitFor(() => expect(finishedRecords(log)).toMatchObject([{ status: "Stopped", monitorId }]));
+    await waitFor(() => expect(finishedRecords(log)).toMatchObject([{ status: "Stopped", monitorId }]));
 
     datadog.release();
     const modelRequests = fakes.model.requests.length;
@@ -82,7 +82,7 @@ describe("Recovered", () => {
     const monitorId = uniqueMonitorId();
     const triggered = alertPayload({ monitorId });
     await sendWebhook(triggered);
-    await vi.waitFor(() => expect(datadog.searches()).toBe(1));
+    await waitFor(() => expect(datadog.searches()).toBe(1));
     const recovered = alertPayload({ monitorId, transition: "Recovered" });
 
     await sendWebhook(recovered);
@@ -98,7 +98,7 @@ describe("Recovered", () => {
   it("only closes the Alert episode when its Investigation has already finished: no note", async () => {
     const monitorId = uniqueMonitorId();
     await sendWebhook(alertPayload({ monitorId }));
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     await settle();
 
     const res = await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
@@ -114,7 +114,7 @@ describe("Recovered", () => {
     const monitorId = uniqueMonitorId();
     const triggered = alertPayload({ monitorId });
     await sendWebhook(triggered);
-    await vi.waitFor(() => expect(datadog.searches()).toBe(1));
+    await waitFor(() => expect(datadog.searches()).toBe(1));
     fakes.teams.fail(1);
 
     await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
@@ -135,7 +135,7 @@ describe("A later Triggered after Recovered", () => {
   it("starts a new Alert episode: a fresh Investigation, on a fresh context, with exactly one report", async () => {
     const monitorId = uniqueMonitorId();
     await sendWebhook(alertPayload({ monitorId }));
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     await settle();
     await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
     await settle();
@@ -145,7 +145,7 @@ describe("A later Triggered after Recovered", () => {
     const res = await sendWebhook(alertPayload({ monitorId, title: "[Triggered] checkout errors are back" }));
 
     expect(await res.json()).toEqual({ outcome: "opened" });
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     expect(fakes.teams.posts[1].text).toContain("Investigation report:");
     expect(fakes.teams.posts[1].text).toContain("checkout errors are back");
     const secondEpisode = fakes.model.requests.slice(firstEpisodeRequests);
@@ -161,7 +161,7 @@ describe("A later Triggered after Recovered", () => {
     const monitorId = uniqueMonitorId();
     const triggered = alertPayload({ monitorId });
     await sendWebhook(triggered);
-    await vi.waitFor(() => expect(datadog.searches()).toBe(1));
+    await waitFor(() => expect(datadog.searches()).toBe(1));
     await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
     await untilPosted(triggered, 1);
     datadog.release();
@@ -182,7 +182,7 @@ describe("A later Triggered after Recovered", () => {
     const monitorId = uniqueMonitorId();
     const triggered = alertPayload({ monitorId });
     await sendWebhook(triggered);
-    await vi.waitFor(() => expect(datadog.searches()).toBe(1));
+    await waitFor(() => expect(datadog.searches()).toBe(1));
     fakes.teams.fail(1); // the stopped on recovery note is delayed, so the new Triggered arrives mid-stop
 
     await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
@@ -194,7 +194,7 @@ describe("A later Triggered after Recovered", () => {
     expect(note.text).toMatch(/stopped/i);
     expect(report.text).toContain("Investigation report:");
     expect(report.text).toContain("checkout errors are back");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(finishedRecords(log).map((r) => [r.episode, r.status])).toEqual([
         [1, "Stopped"],
         [2, "Completed"],

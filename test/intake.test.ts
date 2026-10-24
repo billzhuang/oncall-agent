@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { alertPayload, cleanUp, installFakes, sendWebhook, settle, uniqueMonitorId, type Fakes } from "./harness";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { alertPayload, cleanUp, installFakes, sendWebhook, settle, uniqueMonitorId, type Fakes, waitFor } from "./harness";
 
 let fakes: Fakes;
 beforeEach(() => {
@@ -15,7 +15,7 @@ describe("Alert to Teams", () => {
 
     expect(res.status).toBe(202);
     expect(await res.json()).toEqual({ outcome: "opened" });
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(post.channel).toBe("sre");
     expect(post.text).toContain("High error rate on checkout");
@@ -29,7 +29,7 @@ describe("Alert to Teams", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].text).toContain(`https://app.datadoghq.eu/monitors/${monitorId}`);
     expect(fakes.teams.posts[0].text).not.toContain("evil.example");
   });
@@ -37,7 +37,7 @@ describe("Alert to Teams", () => {
   it("does not let alert text add links to the Teams message", async () => {
     await sendWebhook(alertPayload({ title: "Disk full [click to fix](https://evil.example/login)" }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].text).toContain("click to fix");
     expect(fakes.teams.posts[0].text).not.toContain("](https://evil.example");
   });
@@ -48,7 +48,7 @@ describe("Alert to Teams", () => {
 
     await sendWebhook({ ...alertPayload({ monitorId }), link });
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].text).toContain(link);
   });
 });
@@ -57,14 +57,14 @@ describe("Teams routing", () => {
   it("posts to the Org's default channel when the monitor has no team tag", async () => {
     await sendWebhook(alertPayload({ tags: ["oncall-agent:enabled", "service:checkout"] }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].channel).toBe("gap-default");
   });
 
   it("posts to the Org's default channel when the team tag has no channel mapping", async () => {
     await sendWebhook(alertPayload({ org: "wk", tags: ["oncall-agent:enabled", "team:search"] }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].channel).toBe("wk-default");
   });
 
@@ -73,14 +73,14 @@ describe("Teams routing", () => {
 
     await sendWebhook(alertPayload({ tags: ["oncall-agent:enabled", "team:search"] }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].channel).toBe("payments");
   });
 
   it("accepts tags as Datadog's comma-separated $TAGS string", async () => {
     await sendWebhook(alertPayload({ tags: "service:checkout, oncall-agent:enabled, team:payments" }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].channel).toBe("payments");
   });
 });
@@ -148,7 +148,7 @@ describe("Webhook validation", () => {
     const res = await sendWebhook(alert);
 
     expect(res.status).toBe(202);
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
   });
 
   it("rejects a body that is not the webhook contract", async () => {
@@ -171,7 +171,7 @@ describe("Alert episodes", () => {
   it("has no extra effect when Datadog delivers the same webhook twice", async () => {
     const alert = alertPayload();
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
 
     const res = await sendWebhook(alert);
 
@@ -188,7 +188,7 @@ describe("Alert episodes", () => {
 
     const outcomes = await Promise.all(responses.map((r) => r.json()));
     expect(outcomes).toEqual(expect.arrayContaining([{ outcome: "opened" }, { outcome: "duplicate" }]));
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
   });
@@ -198,7 +198,7 @@ describe("Alert episodes", () => {
     async (transition) => {
       const monitorId = uniqueMonitorId();
       await sendWebhook(alertPayload({ monitorId }));
-      await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+      await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
 
       fakes.clock.advance(10 * 60_000);
       const res = await sendWebhook(alertPayload({ monitorId, transition }));
@@ -215,7 +215,7 @@ describe("Alert episodes", () => {
     await sendWebhook(alertPayload({ monitorId, group: "service:checkout" }));
     await sendWebhook(alertPayload({ monitorId, group: "service:search" }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     expect(fakes.teams.posts.map((p) => p.text).join()).toContain("service:search");
   });
 
@@ -224,7 +224,7 @@ describe("Alert episodes", () => {
     await sendWebhook(alertPayload({ org: "gap", monitorId, tags: ["oncall-agent:enabled"] }));
     await sendWebhook(alertPayload({ org: "wk", monitorId, tags: ["oncall-agent:enabled"] }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     expect(fakes.teams.to("gap-default")).toHaveLength(1);
     expect(fakes.teams.to("wk-default")).toHaveLength(1);
   });
@@ -234,12 +234,12 @@ describe("Alert episodes", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await settle();
         expect(fakes.teams.posts).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 250 },
+      { interval: 250 },
     );
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
@@ -276,6 +276,6 @@ describe("Opt-in and transitions", () => {
     await sendWebhook(alertPayload({ monitorId, transition: "Warn" }));
     await sendWebhook(alertPayload({ monitorId, transition: "Triggered" }));
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
   });
 });

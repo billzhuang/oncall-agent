@@ -1,7 +1,10 @@
+import { env } from "cloudflare:workers";
+import { runDurableObjectAlarm } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { coordinatorStub } from "../src/durable";
 import { TEST_SECRETS, testConfig } from "./config";
 import { investigate, textOf, toolCall, type ModelRequest, type Transcript } from "./fakes/model";
-import { alertPayload, cleanUp, gate, installFakes, sendWebhook, settle, type Fakes } from "./harness";
+import { alertPayload, cleanUp, gate, installFakes, sendWebhook, settle, type Fakes, waitFor } from "./harness";
 
 let fakes: Fakes;
 afterEach(cleanUp);
@@ -42,6 +45,18 @@ function holdInvestigations(f: Fakes, monitors: string[]) {
   return { started, release: (monitor: string) => gateFor(monitor).open() };
 }
 
+/** Investigations whose run slot lease the Coordinator extended, from its structured log. */
+const leaseExtensions = (log: { mock: { calls: unknown[][] } }): string[] =>
+  log.mock.calls
+    .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : undefined))
+    .filter((r) => r?.event === "coordinator.lease-extended")
+    .map((r) => String(r.investigation));
+
+/** Runs the Coordinator's due wake-ups (dispatch) until none is left. */
+async function settleCoordinator(): Promise<void> {
+  for (let round = 0; round < 5 && (await runDurableObjectAlarm(coordinatorStub(env))); round++);
+}
+
 describe("Concurrency", () => {
   it("runs at most 5 Investigations at once and starts waiting ones in arrival order as slots free", async () => {
     fakes = installFakes();
@@ -49,22 +64,22 @@ describe("Concurrency", () => {
     const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
     for (const alert of alerts) await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(held.started).toHaveLength(5));
+    await waitFor(() => expect(held.started).toHaveLength(5));
     await settle();
     expect(held.started).toEqual(alerts.slice(0, 5).map((a) => a.monitorId));
     expect(fakes.teams.posts).toHaveLength(0);
 
     held.release(alerts[0].monitorId);
-    await vi.waitFor(() => expect(held.started).toHaveLength(6));
+    await waitFor(() => expect(held.started).toHaveLength(6));
     expect(held.started[5]).toBe(alerts[5].monitorId);
     expect(fakes.teams.posts).toHaveLength(1);
 
     held.release(alerts[3].monitorId);
-    await vi.waitFor(() => expect(held.started).toHaveLength(7));
+    await waitFor(() => expect(held.started).toHaveLength(7));
     expect(held.started[6]).toBe(alerts[6].monitorId);
 
     for (const alert of alerts) held.release(alert.monitorId);
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(7));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(7));
     expect(fakes.teams.posts.every((p) => p.text.startsWith("Investigation report"))).toBe(true);
   });
 
@@ -74,12 +89,12 @@ describe("Concurrency", () => {
     const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
     for (const alert of alerts) await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(held.started).toHaveLength(2));
+    await waitFor(() => expect(held.started).toHaveLength(2));
     await settle();
     expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]);
 
     held.release(alerts[1].monitorId);
-    await vi.waitFor(() => expect(held.started).toEqual(alerts.map((a) => a.monitorId)));
+    await waitFor(() => expect(held.started).toEqual(alerts.map((a) => a.monitorId)));
   });
 
   it("keeps the run slot of an Investigation still running past its lease, so the limit is never exceeded", async () => {
@@ -88,17 +103,20 @@ describe("Concurrency", () => {
     const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
     await sendWebhook(alerts[0]);
     await sendWebhook(alerts[1]);
-    await vi.waitFor(() => expect(held.started).toHaveLength(1));
+    await waitFor(() => expect(held.started).toHaveLength(1));
 
     // Past the run slot's lease (30-minute limit plus 5), short of its hard cap (plus 15). No settle(): it would
     // run the Investigation's alarm, and the time limit (#4) may then rightly stop it and free its slot.
+    const log = vi.spyOn(console, "log");
     fakes.clock.advance(40 * 60_000);
     await sendWebhook(alerts[2]);
-    await new Promise((r) => setTimeout(r, 500));
+    // Settle point: the Coordinator asked the running Investigation and extended its lease, then ran its wake-ups.
+    await waitFor(() => expect(leaseExtensions(log).some((name) => name.includes(alerts[0].monitorId))).toBe(true));
+    await settleCoordinator();
     expect(held.started).toEqual([alerts[0].monitorId]);
 
     held.release(alerts[0].monitorId);
-    await vi.waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
+    await waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
   });
 
   it("takes back the run slot of an Investigation stuck past its hard cap, stopping it (Partial)", async () => {
@@ -107,13 +125,13 @@ describe("Concurrency", () => {
     const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
     await sendWebhook(alerts[0]);
     await sendWebhook(alerts[1]);
-    await vi.waitFor(() => expect(held.started).toHaveLength(1));
+    await waitFor(() => expect(held.started).toHaveLength(1));
 
     fakes.clock.advance(46 * 60_000); // stuck in a Datadog call past the 30-minute limit plus 15
     await sendWebhook(alerts[2]);
 
-    await vi.waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].text).toMatch(/^Investigation partial/);
     expect(fakes.teams.posts[0].text).toContain(alerts[0].monitorId);
     expect(held.started).toHaveLength(2);
@@ -128,7 +146,7 @@ describe("Daily budget", () => {
   async function alertAndWait(alert: ReturnType<typeof alertPayload>) {
     const before = fakes.teams.posts.length;
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(before + 1));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(before + 1));
     await settle();
     return fakes.teams.posts[before];
   }
@@ -161,8 +179,8 @@ describe("Daily budget", () => {
     const second = alertPayload();
 
     await sendWebhook(first);
-    await vi.waitFor(() => expect(investigatedMonitors().has(first.monitorId)).toBe(true));
-    await vi.waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2)); // report submitted
+    await waitFor(() => expect(investigatedMonitors().has(first.monitorId)).toBe(true));
+    await waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2)); // report submitted
     await settle();
     await sendWebhook(second);
     await settle();
@@ -201,15 +219,15 @@ describe("Daily budget", () => {
     const alerts = Array.from({ length: 3 }, () => alertPayload());
     const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
     await sendWebhook(alerts[0]);
-    await vi.waitFor(() => expect(held.started).toHaveLength(1));
+    await waitFor(() => expect(held.started).toHaveLength(1));
 
     await sendWebhook(alerts[1]);
     await sendWebhook(alerts[2]);
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
     expect(fakes.teams.posts.map((p) => /budget exhausted/i.test(p.text))).toEqual([true, true]);
 
     held.release(alerts[0].monitorId);
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(3));
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(3));
     await settle();
     expect(fakes.teams.posts[2].text).toMatch(/^Investigation report/);
     expect(held.started).toEqual([alerts[0].monitorId]);

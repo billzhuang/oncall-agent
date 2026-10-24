@@ -6,7 +6,9 @@ import {
   runDurableObjectAlarm,
   runInDurableObject,
 } from "cloudflare:test";
+import { vi } from "vitest";
 import { parseConfig } from "../src/config";
+import { investigationStub } from "../src/durable";
 import { resetPorts, setPorts } from "../src/ports";
 import { fakeClock } from "./fakes/clock";
 import { defaultDatadogTools, fakeDatadogMcp } from "./fakes/datadog-mcp";
@@ -138,7 +140,15 @@ function orgOf(body: unknown): keyof typeof ORG_SECRETS {
 /** The Investigation Durable Object of an Alert episode, as a fresh stub (e.g. after eviction). */
 export function investigationOf(payload: { orgId: string; monitorId: string; group: string }) {
   const org = payload.orgId === WK_ORG_ID ? "wk" : "gap";
-  return env.INVESTIGATION.getByName(`${org}:${payload.monitorId}:${payload.group}`);
+  return investigationStub(env, { org, monitorId: payload.monitorId, group: payload.group });
+}
+
+/**
+ * Waits until `check` passes. The suite runs many Durable Objects in one workerd under load, so the default is
+ * generous: a slow pass is fine, a flaky failure is not.
+ */
+export function waitFor<T>(check: () => T | Promise<T>, opts: { timeout?: number; interval?: number } = {}): Promise<T> {
+  return vi.waitFor(check, { timeout: 15_000, interval: 50, ...opts });
 }
 
 /** A promise the test resolves later, e.g. to hold a Datadog tool call open. */

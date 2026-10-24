@@ -1,5 +1,5 @@
 import { abortAllDurableObjects, runDurableObjectAlarm } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   alertPayload,
   cleanUp,
@@ -10,6 +10,7 @@ import {
   settle,
   uniqueMonitorId,
   type Fakes,
+  waitFor,
 } from "./harness";
 import { TEST_SECRETS } from "./config";
 import { defaultDatadogTools } from "./fakes/datadog-mcp";
@@ -91,7 +92,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(fakes.workspace.checkouts).toMatchObject([{ owner: "acme", repo: service, sha: DEPLOYED }]);
     const [read] = toolResults("read");
     expect(read!.isError).toBe(false);
@@ -107,7 +108,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(fakes.github.tokens).toHaveLength(1);
     const [issued] = fakes.github.tokens;
     expect(issued).toMatchObject({ repositories: [service], permissions: { contents: "read" } });
@@ -128,7 +129,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const offered = new Set(fakes.model.requests.flatMap((r) => r.tools));
     const workspaceTools = [...offered].filter((t) => !t.startsWith("datadog_") && t !== "submit_report").sort();
     expect(workspaceTools).toEqual(["edit", "find", "grep", "ls", "read", "write"]);
@@ -159,7 +160,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const results = ["read", "write", "edit", "ls", "grep", "find"].flatMap(toolResults);
     expect(results).toHaveLength(15);
     for (const result of results) expect(result.isError).toBe(true);
@@ -188,7 +189,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(fakes.workspace.text()).toContain("[remote"); // the clone did write repository metadata
     const outputs = ["ls", "find", "grep"].flatMap(toolResults);
     expect(outputs).toHaveLength(7);
@@ -217,7 +218,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(toolResults("find")[0]!.text).toContain("src/guard.ts");
     expect(toolResults("grep")[0]!.text).toContain("src/checkout.ts");
     const changes = await fakes.workspace.of(investigationOf(alert).id.toString()).changes();
@@ -239,7 +240,7 @@ describe("Code workspace", () => {
     await sendWebhook(alertFor(unmapped));
     await sendWebhook(alertFor(notEnabled));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(2));
+    await waitFor(() => expect(reports()).toHaveLength(2));
     expect(fakes.github.tokens).toEqual([]);
     expect(fakes.workspace.checkouts).toEqual([]);
     const offered = new Set(fakes.model.requests.flatMap((r) => r.tools));
@@ -256,7 +257,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const [issued] = fakes.github.tokens;
     const report = reports()[0]!.text;
     expect(report).toContain("could not be checked out");
@@ -270,7 +271,7 @@ describe("Code workspace", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(reports()[0]!.text).toContain("could not be checked out");
     expect(reports()[0]!.text).toContain("not a full commit SHA");
     expect(fakes.github.tokens).toEqual([]);
@@ -300,16 +301,16 @@ describe("Code workspace", () => {
     );
     const alert = alertFor(service);
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(searches).toBe(1));
+    await waitFor(() => expect(searches).toBe(1));
 
     await abortAllDurableObjects(); // evicted while the Datadog call is in flight
     held.open();
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await runDurableObjectAlarm(investigationOf(alert));
         expect(reports()).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 200 },
+      { interval: 200 },
     );
 
     expect(toolResults("read").at(-1)!.text).toContain("customer may be null");

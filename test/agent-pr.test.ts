@@ -9,6 +9,7 @@ import {
   settle,
   uniqueMonitorId,
   type Fakes,
+  waitFor,
 } from "./harness";
 import { GITHUB_APP_ID, TEST_SECRETS } from "./config";
 import { toolCall, type Script, type Transcript } from "./fakes/model";
@@ -143,7 +144,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const pulls = fakes.github.pulls(repo);
     expect(pulls).toHaveLength(1);
     const [pr] = pulls;
@@ -173,7 +174,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(fakes.github.pulls(repo)).toHaveLength(1);
     expect(writeTokens()).toHaveLength(1);
     const [issued] = writeTokens();
@@ -200,7 +201,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     await settle();
     expect(fakes.github.pulls(repo)).toEqual([]);
     expect(fakes.github.refWrites).toEqual([]);
@@ -218,7 +219,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     await settle();
     expect(fakes.github.pulls(repo)).toEqual([]);
     expect(fakes.github.refWrites).toEqual([]);
@@ -233,7 +234,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const [pr] = fakes.github.pulls(repo);
     expect(pr!.body).toMatch(/drift/i);
     expect(pr!.body).toContain("src/checkout.ts");
@@ -247,7 +248,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const [pr] = fakes.github.pulls(repo);
     expect(pr!.body).not.toMatch(/drift/i);
     expect(fakes.github.files(repo, pr!.head)).toEqual({ ...FILES, "src/cart.ts": "export const cart = { total: 1 };\n", "src/checkout.ts": FIXED });
@@ -265,7 +266,7 @@ describe("Agent PR", () => {
     const opened = alertFor(service, { monitorId });
 
     await sendWebhook(opened);
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const [pr] = fakes.github.pulls(repo);
     const firstHead = fakes.github.commit(repo, pr!.head)!.sha;
 
@@ -273,7 +274,7 @@ describe("Agent PR", () => {
     await sendWebhook({ ...opened, alertId: `${opened.alertId}-r`, transition: "Recovered" });
     await sendWebhook({ ...opened, alertId: `${opened.alertId}-2`, title: "[Triggered] second episode of checkout errors" });
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(2));
+    await waitFor(() => expect(reports()).toHaveLength(2));
     await settle();
     const pulls = fakes.github.pulls(repo);
     expect(pulls).toHaveLength(1);
@@ -305,15 +306,15 @@ describe("Agent PR", () => {
 
     await sendWebhook(alert);
     // GitHub carried it out but its answer never arrived; the finalize job saw the failure and will retry.
-    await vi.waitFor(() => expect(loss.lost()).toBe(true));
-    await vi.waitFor(() => expect(failed.mock.calls.some(([line]) => String(line).includes("job finalize failed"))).toBe(true));
+    await waitFor(() => expect(loss.lost()).toBe(true));
+    await waitFor(() => expect(failed.mock.calls.some(([line]) => String(line).includes("job finalize failed"))).toBe(true));
     await abortAllDurableObjects(); // evicted before the retry
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await runDurableObjectAlarm(investigationOf(alert));
         expect(reports()).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 200 },
+      { interval: 200 },
     );
     await settle();
 
@@ -341,7 +342,7 @@ describe("Agent PR", () => {
 
       await sendWebhook(alertFor(service));
 
-      await vi.waitFor(() => expect(reports()).toHaveLength(1));
+      await waitFor(() => expect(reports()).toHaveLength(1));
       await settle();
       expect(fakes.github.pulls(repo)).toEqual([]);
       expect(fakes.github.refWrites).toEqual([]);
@@ -365,7 +366,7 @@ describe("Agent PR", () => {
     await sendWebhook(alertFor(allowed.service));
     await sendWebhook(alertFor(blocked.service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(2));
+    await waitFor(() => expect(reports()).toHaveLength(2));
     await settle();
     expect(fakes.github.pulls(allowed.repo)).toHaveLength(1);
     expect(fakes.github.pulls(blocked.repo)).toEqual([]);
@@ -394,7 +395,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alert);
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     const [pr] = fakes.github.pulls(repo);
     // Everything the model wrote is there, as code.
     for (const text of ["ping @octocat", "<img src=x onerror=alert(1)>", "five backticks", "@octocat broke it in #45", "docs/@octocat-#44 <b>.md"]) {
@@ -418,7 +419,7 @@ describe("Agent PR", () => {
 
     await sendWebhook(alertFor(service));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    await waitFor(() => expect(reports()).toHaveLength(1));
     expect(reports()[0]!.text).toContain("could not be opened");
     expect(reports()[0]!.text).toContain("404");
     for (const { token } of fakes.github.tokens) expect(reports()[0]!.text).not.toContain(token);
@@ -433,7 +434,7 @@ describe("Agent PR", () => {
     await sendWebhook(alertFor(pilot.service, { team: "payments" }));
     await sendWebhook(alertFor(other.service, { team: "sre" }));
 
-    await vi.waitFor(() => expect(reports()).toHaveLength(2));
+    await waitFor(() => expect(reports()).toHaveLength(2));
     await settle();
     expect(fakes.github.pulls(pilot.repo)).toHaveLength(1);
     expect(fakes.github.pulls(other.repo)).toEqual([]);

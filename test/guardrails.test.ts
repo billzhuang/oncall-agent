@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { abortAllDurableObjects, runDurableObjectAlarm } from "cloudflare:test";
-import { alertPayload, cleanUp, gate, installFakes, investigationOf, sendWebhook, settle, type Fakes } from "./harness";
+import { alertPayload, cleanUp, gate, installFakes, investigationOf, sendWebhook, settle, type Fakes, waitFor } from "./harness";
 import { TEST_SECRETS } from "./config";
 import { toolCall, type Script } from "./fakes/model";
 
@@ -37,7 +37,7 @@ describe("Cost cap", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1), { timeout: 10_000 });
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(post.channel).toBe("sre");
     expect(post.text).toMatch(/partial/i);
@@ -46,7 +46,7 @@ describe("Cost cap", () => {
     expect(post.text).toContain("NullPointerException in CheckoutController[.]placeOrder"); // evidence gathered so far
     expect(post.text).not.toContain("Investigation report:");
     expect(fakes.model.requests.length).toBeLessThan(10);
-    await vi.waitFor(() => expect(finishedRecords(log)).toMatchObject([{ status: "Partial" }]));
+    await waitFor(() => expect(finishedRecords(log)).toMatchObject([{ status: "Partial" }]));
     expect(finishedRecords(log)[0].costUsd).toBeGreaterThanOrEqual(3);
     const requests = fakes.model.requests.length;
     await settle();
@@ -71,7 +71,7 @@ describe("30-minute limit", () => {
 
     await sendWebhook(alertPayload());
 
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1), { timeout: 10_000 });
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(post.text).toMatch(/partial/i);
     expect(post.text).toMatch(/30 minutes/);
@@ -98,15 +98,15 @@ describe("30-minute limit", () => {
     fakes.model.script(keepsSearching);
     const alert = alertPayload();
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(fakes.datadog.calls).toHaveLength(1));
+    await waitFor(() => expect(fakes.datadog.calls).toHaveLength(1));
 
     fakes.clock.advance(minutes(31));
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await runDurableObjectAlarm(investigationOf(alert));
         expect(fakes.teams.posts).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 200 },
+      { interval: 200 },
     );
 
     const [post] = fakes.teams.posts;
@@ -127,15 +127,15 @@ describe("Once across replays", () => {
     fakes.teams.fail(1);
     const alert = alertPayload();
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
 
     await abortAllDurableObjects();
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await runDurableObjectAlarm(investigationOf(alert));
         expect(fakes.teams.posts).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 250 },
+      { interval: 250 },
     );
     expect(fakes.teams.posts[0].text).toMatch(/cost cap/i);
     const requests = fakes.model.requests.length;
@@ -154,15 +154,15 @@ describe("Crash", () => {
     fakes.datadog.setDown(true);
     const alert = alertPayload();
     await sendWebhook(alert);
-    await vi.waitFor(() => expect(fakes.datadog.requests.length).toBeGreaterThan(0));
+    await waitFor(() => expect(fakes.datadog.requests.length).toBeGreaterThan(0));
 
     fakes.clock.advance(minutes(31));
-    await vi.waitFor(
+    await waitFor(
       async () => {
         await runDurableObjectAlarm(investigationOf(alert));
         expect(fakes.teams.posts).toHaveLength(1);
       },
-      { timeout: 15_000, interval: 200 },
+      { interval: 200 },
     );
 
     const [post] = fakes.teams.posts;
