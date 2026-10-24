@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "lib": ["es2024"],
+    "types": ["@cloudflare/vitest-plugin/types"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["src", "test", "worker-configuration.d.ts"]
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "oncall-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI", "remote": true },
+  "triggers": { "crons": ["0 6 * * *"] },
+  "vars": {
+    // Durable Objects are created in this jurisdiction (see src/durable.ts). Tests blank it: workerd has no jurisdictions.
+    "DO_JURISDICTION": "eu",
+    // Org registry, Owning team -> Teams channel map, switches, model and budgets. Validated by src/config.ts.
+    // Every *Secret value is the NAME of a Worker secret, never the secret itself: this repo is public.
+    "ONCALL_CONFIG": {
+      "orgs": [
+        {
+          "name": "gap",
+          "site": "datadoghq.eu",
+          "datadogOrgId": "SET_GAP_DATADOG_ORG_ID",
+          "tokenSecret": "GAP_DATADOG_TOKEN",
+          "tokenExpiresOn": "2027-01-01",
+          "webhookSecret": "GAP_WEBHOOK_SECRET",
+          "defaultTeamsSecret": "GAP_DEFAULT_TEAMS_URL"
+        }
+      ],
+      "teams": { "sre": "TEAMS_SRE_URL" },
+      "reportOnly": { "global": true, "teams": {} },
+      "modelId": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "budgets": { "investigationUsd": 3, "investigationMinutes": 30, "dailyUsd": 30, "maxConcurrent": 5 }
+    }
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "INVESTIGATION", "class_name": "Investigation" },
+      { "name": "COORDINATOR", "class_name": "Coordinator" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Investigation", "Coordinator"] }]
+}
