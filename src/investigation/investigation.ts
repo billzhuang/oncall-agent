@@ -146,8 +146,9 @@ export class Investigation extends DurableObject<Env> {
     const episode = await this.#episode();
     if (!episode || episode.status !== "Running") return;
     const config = ports().config(this.env);
-    await this.#remind(episode, await this.#resolveRepo(episode));
+    const resolution = await this.#resolveRepo(episode);
     if (!modelAvailable(this.env, config.modelId)) {
+      await this.#remind(episode, resolution);
       return this.#endWithoutReport(episode, `the configured model ${config.modelId} is not available`);
     }
     const specs = await this.datadog.listReadOnlyTools(config.datadog.tools);
@@ -159,6 +160,8 @@ export class Investigation extends DurableObject<Env> {
       await this.ctx.storage.put(costBaselineKey(episode), await this.#spentUsd());
     }
     await this.harness.submit(alertPrompt(episode.alert), { operationId: operationId(episode) });
+    // After the submit, so a Teams outage delays only the reminder, not the agent.
+    await this.#remind(episode, resolution);
     // Host jobs run only while pi is idle, so this looks once the run has ended (or at a heartbeat).
     await this.#scheduleFinalize();
   }
