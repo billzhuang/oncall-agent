@@ -168,6 +168,81 @@ describe("Webhook validation", () => {
   });
 });
 
+describe("Alert episodes", () => {
+  it("has no extra effect when Datadog delivers the same webhook twice", async () => {
+    const alert = alertPayload();
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+
+    const res = await sendWebhook(alert);
+
+    expect(res.status).toBe(202);
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+  });
+
+  it("has no extra effect when the duplicate arrives before the report is posted", async () => {
+    const alert = alertPayload();
+
+    await Promise.all([sendWebhook(alert), sendWebhook(alert)]);
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+  });
+
+  it.each(["Triggered", "Re-Triggered"])(
+    "joins a %s re-trigger to the open Alert episode's Investigation: one report",
+    async (transition) => {
+      const monitorId = uniqueMonitorId();
+      await sendWebhook(alertPayload({ monitorId }));
+      await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+
+      fakes.clock.advance(10 * 60_000);
+      const res = await sendWebhook(alertPayload({ monitorId, transition }));
+
+      expect(res.status).toBe(202);
+      await settle();
+      expect(fakes.teams.posts).toHaveLength(1);
+    },
+  );
+
+  it("gives each group of a monitor its own Investigation", async () => {
+    const monitorId = uniqueMonitorId();
+    await sendWebhook(alertPayload({ monitorId, group: "service:checkout" }));
+    await sendWebhook(alertPayload({ monitorId, group: "service:search" }));
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    expect(fakes.teams.posts.map((p) => p.text).join()).toContain("service:search");
+  });
+
+  it("gives the same monitor in two Orgs two Investigations", async () => {
+    const monitorId = uniqueMonitorId();
+    await sendWebhook(alertPayload({ org: "gap", monitorId, tags: ["oncall-agent:enabled"] }));
+    await sendWebhook(alertPayload({ org: "wk", monitorId, tags: ["oncall-agent:enabled"] }));
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    expect(fakes.teams.to("gap-default")).toHaveLength(1);
+    expect(fakes.teams.to("wk-default")).toHaveLength(1);
+  });
+
+  it("still posts the report, once, when Teams is failing at first", async () => {
+    fakes.teams.fail(2);
+
+    await sendWebhook(alertPayload());
+
+    await vi.waitFor(
+      async () => {
+        await settle();
+        expect(fakes.teams.posts).toHaveLength(1);
+      },
+      { timeout: 15_000, interval: 250 },
+    );
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+  });
+});
+
 describe("Opt-in and transitions", () => {
   it("ignores a monitor without the oncall-agent:enabled tag", async () => {
     const res = await sendWebhook(alertPayload({ tags: ["team:sre", "oncall-agent:disabled"] }));
