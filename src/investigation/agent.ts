@@ -1,8 +1,12 @@
 import { createModels } from "@earendil-works/pi-ai/models";
+import type { Context } from "@earendil-works/chord";
 import {
   GenerationTask,
   Harness,
   hook,
+  ToolTask,
+  UsageDoc,
+  type HookApi,
   type HookRegistration,
   type Registry,
   type ToolRegistration,
@@ -30,6 +34,22 @@ export interface AgentHost {
   hasReport(): Promise<boolean>;
   /** Records that the agent was told to submit; false when it already was (it is told once). */
   firstNudge(): Promise<boolean>;
+  /** The current Investigation's guardrails: when it started, its spend before it started, and its budgets. */
+  guardrails(): Promise<Guardrails | undefined>;
+  /** Stops the agent's run (durable flag, then an un-awaited abort); the first reason given is reported. */
+  interrupt(reason: string): Promise<void>;
+  /** Keeps a tool result as evidence, for a partial message if the run is stopped. Idempotent per call. */
+  evidenceGathered(callId: string, tool: string, text: string): Promise<void>;
+}
+
+/** Per-Investigation limits (from config) and what they are measured from. */
+export interface Guardrails {
+  /** Business time (`ports().now()`) the Investigation started running. */
+  startedAt: number;
+  /** pi's session spend when the Investigation started; its own spend is what came after. */
+  costBaselineUsd: number;
+  maxUsd: number;
+  maxMinutes: number;
 }
 
 const PREAMBLE = `You are the oncall agent. You investigate one Datadog alert (an Alert episode) in one Datadog Org.
@@ -78,12 +98,45 @@ function submitReportTool(host: AgentHost): ToolRegistration<typeof ReportSchema
  * here too: they record a durable flag and abort un-awaited, since a host job would wait for the run to end.
  */
 function agentHooks(host: AgentHost): HookRegistration[] {
+  /** Interrupts the run when the Investigation is over its cost cap or time limit; returns the reason. */
+  const enforceGuardrails = async (api: HookApi, context: Context): Promise<string | undefined> => {
+    const limits = await host.guardrails();
+    if (!limits) return undefined;
+    const usage = await api.snapshot(UsageDoc, api.conversationId, context);
+    const spent =
+      Object.values(usage?.models ?? {}).reduce((sum, u) => sum + u.cost.total, 0) +
+      Object.values(usage?.tools ?? {}).reduce((sum, u) => sum + u.cost.total, 0) -
+      limits.costBaselineUsd;
+    let reason: string | undefined;
+    if (spent >= limits.maxUsd) {
+      reason = `cost cap of $${limits.maxUsd.toFixed(2)} reached ($${spent.toFixed(2)} spent)`;
+    } else if (ports().now() - limits.startedAt >= limits.maxMinutes * 60_000) {
+      reason = `time limit of ${limits.maxMinutes} minutes reached`;
+    }
+    if (reason) await host.interrupt(reason);
+    return reason;
+  };
   return [
     hook(GenerationTask, {
+      afterResponse: async (_message, api, context) => {
+        await enforceGuardrails(api, context);
+      },
       // A text answer would end the run without a report: tell the agent once to submit it.
       onYield: async () => {
         if (await host.hasReport()) return undefined;
         return (await host.firstNudge()) ? { continue: NUDGE } : undefined;
+      },
+    }),
+    hook(ToolTask, {
+      beforeTool: async (_call, api, context) => {
+        const reason = await enforceGuardrails(api, context);
+        return reason ? { block: `The Investigation was stopped: ${reason}.` } : undefined;
+      },
+      afterTool: async (call, result) => {
+        if (call.name !== FINISHING_TOOL && !result.isError) {
+          await host.evidenceGathered(call.id, call.name, textOf(result.output));
+        }
+        return undefined;
       },
     }),
   ];
@@ -127,6 +180,12 @@ export function createAgentHarness(host: AgentHost): PiHarness {
       );
     },
   });
+}
+
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((c) => (c && typeof c === "object" && "text" in c ? String(c.text) : "")).join(" ");
 }
 
 /** Whether the provider lists this model (the model ID comes from config). */

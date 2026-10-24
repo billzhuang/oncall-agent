@@ -16,8 +16,11 @@ import {
   type AgentHost,
 } from "./agent";
 import {
+  MAX_EVIDENCE_LINES,
   boundedReport,
+  evidenceLine,
   failedMessage,
+  partialMessage,
   reportMessage,
   type InvestigationRecord,
   type InvestigationReport,
@@ -61,6 +64,17 @@ const RUN_POLL_MS = 30_000;
 const reportKey = (e: Episode) => `report:${e.number}`;
 const nudgedKey = (e: Episode) => `nudged:${e.number}`;
 const costBaselineKey = (e: Episode) => `cost-baseline:${e.number}`;
+/** Set when the run is interrupted (cost cap, time limit): `{ reason, at }`. The first reason wins. */
+const interruptedKey = (e: Episode) => `interrupted:${e.number}`;
+/** Set once the agent's one input was submitted. */
+const submittedKey = (e: Episode) => `submitted:${e.number}`;
+/** Evidence gathered by the agent's tools, one key per tool call so parallel and replayed calls never clash. */
+const evidencePrefix = (e: Episode) => `evidence:${e.number}:`;
+
+interface Interruption {
+  reason: string;
+  at: number;
+}
 /** The agent's one submission per Alert episode; pi ignores a second submit with the same id. */
 const operationId = (e: Episode) => `episode:${e.number}`;
 
@@ -150,7 +164,9 @@ export class Investigation extends DurableObject<Env> {
     if ((await this.ctx.storage.get(costBaselineKey(episode))) === undefined) {
       await this.ctx.storage.put(costBaselineKey(episode), await this.#spentUsd());
     }
+    if (await this.ctx.storage.get(interruptedKey(episode))) return this.#scheduleFinalize();
     await this.harness.submit(alertPrompt(episode.alert), { operationId: operationId(episode) });
+    await this.ctx.storage.put(submittedKey(episode), true);
     // Host jobs run only while pi is idle, so this looks once the run has ended (or at a heartbeat).
     await this.#scheduleFinalize();
   }
@@ -163,12 +179,57 @@ export class Investigation extends DurableObject<Env> {
     const episode = await this.#episode();
     if (!episode || episode.status !== "Running") return;
     const running = (await this.harness.pending()).some((p) => p.operationId === operationId(episode));
-    if (running) return { rescheduleAt: Date.now() + RUN_POLL_MS };
+    const interruption = await this.ctx.storage.get<Interruption>(interruptedKey(episode));
+    if (running) {
+      if (interruption) this.#abortRun(); // again: an eviction may have come between the flag and the abort
+      return { rescheduleAt: Date.now() + RUN_POLL_MS };
+    }
+    if (interruption) return this.#endInterrupted(episode, interruption);
     const report = await this.ctx.storage.get<InvestigationReport>(reportKey(episode));
     if (!report) return this.#endWithoutReport(episode, await this.#runEndReason(episode));
     const record = await this.#record(episode);
     await this.#notify(episode, "report", reportMessage(episode.alert, report, record));
     await this.#finish(episode, "Completed", record);
+  }
+
+  /**
+   * Stops the agent's run, e.g. on the cost cap or time limit: records why (durably, first reason wins), then
+   * aborts without waiting, since abort waits for the run to go idle and may be called from the run's own hooks.
+   * Once the run has stopped, `finalize` posts the outcome.
+   */
+  async interrupt(reason: string): Promise<void> {
+    await this.lifecycle.start();
+    await this.#interrupt(reason);
+  }
+
+  async #interrupt(reason: string): Promise<void> {
+    const episode = await this.#episode();
+    if (!episode || episode.status !== "Running") return;
+    const key = interruptedKey(episode);
+    if (!(await this.ctx.storage.get(key))) {
+      await this.ctx.storage.put(key, { reason, at: ports().now() } satisfies Interruption);
+    }
+    this.#abortRun();
+  }
+
+  /** Aborts the agent's run without awaiting it, then has `finalize` look at once. */
+  #abortRun(): void {
+    void this.harness
+      .abort()
+      .then(() => this.#scheduleFinalize())
+      .catch((error) => console.error(`Investigation ${this.lifecycle.name}: abort failed`, error));
+  }
+
+  /** A guardrail stopped the run: post the partial message with the evidence so far, and finish Partial. */
+  async #endInterrupted(episode: Episode, interruption: Interruption): Promise<void> {
+    const record = await this.#record(episode);
+    const evidence = await this.ctx.storage.list<{ at: number; line: string }>({ prefix: evidencePrefix(episode) });
+    const lines = [...evidence.values()]
+      .sort((a, b) => a.at - b.at)
+      .slice(0, MAX_EVIDENCE_LINES)
+      .map((e) => e.line);
+    await this.#notify(episode, "partial", partialMessage(episode.alert, interruption.reason, lines, record));
+    await this.#finish(episode, "Partial", record, interruption.reason);
   }
 
   async #endWithoutReport(episode: Episode, reason: string): Promise<void> {
@@ -300,6 +361,23 @@ export class Investigation extends DurableObject<Env> {
         if (await storage.get(key)) return false;
         await storage.put(key, true);
         return true;
+      },
+      guardrails: async () => {
+        const episode = await this.#episode();
+        if (!episode || episode.status !== "Running") return undefined;
+        const { budgets } = ports().config(this.env);
+        return {
+          startedAt: episode.startedAt ?? episode.openedAt,
+          costBaselineUsd: (await storage.get<number>(costBaselineKey(episode))) ?? 0,
+          maxUsd: budgets.investigationUsd,
+          maxMinutes: budgets.investigationMinutes,
+        };
+      },
+      interrupt: (reason) => this.#interrupt(reason),
+      evidenceGathered: async (callId, tool, text) => {
+        const key = `${evidencePrefix(await current())}${callId}`;
+        if (await storage.get(key)) return;
+        await storage.put(key, { at: ports().now(), line: evidenceLine(tool, text) });
       },
     };
   }

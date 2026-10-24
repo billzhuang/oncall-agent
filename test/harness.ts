@@ -14,12 +14,12 @@ import { GAP_ORG_ID, MODEL_ID, TEST_SECRETS, WK_ORG_ID, testConfig } from "./con
  * Replaces every external system behind the Worker's outer edge with a fake the test controls,
  * through the one seam (`src/ports.ts`). Call in `beforeEach`; pair with `cleanUp()` in `afterEach`.
  */
-export function installFakes(opts: { config?: Record<string, unknown>; now?: number } = {}) {
+export function installFakes(opts: { config?: Record<string, unknown>; now?: number; costPerMTok?: number } = {}) {
   const clock = fakeClock(opts.now);
   const teams = fakeTeams();
   const github = fakeGitHub();
   const datadog = fakeDatadogMcp();
-  const model = scriptedModel(String(opts.config?.modelId ?? MODEL_ID));
+  const model = scriptedModel(String(opts.config?.modelId ?? MODEL_ID), opts.costPerMTok);
   datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, defaultDatadogTools("gap"));
   datadog.org(TEST_SECRETS.WK_DATADOG_TOKEN, defaultDatadogTools("wk"));
   const network = router({ "teams.test": teams, "api.github.com": github, "mcp.datadoghq.eu": datadog });

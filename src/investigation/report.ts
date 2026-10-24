@@ -65,6 +65,37 @@ export function failedMessage(alert: Alert, reason: string, record: Investigatio
   };
 }
 
+/**
+ * The message when a guardrail (cost cap, time limit) stopped an Investigation before it submitted its report:
+ * the reason, and the evidence the agent had gathered so far (Datadog tool results, untrusted).
+ */
+export function partialMessage(
+  alert: Alert,
+  reason: string,
+  evidence: readonly string[],
+  record: InvestigationRecord,
+): TeamsMessage {
+  return {
+    title: `Investigation partial: ${alertName(alert)}`,
+    lines: [
+      `Partial: ${reason}. The Investigation stopped before it finished; below is what it gathered so far. Please check this alert yourself.`,
+      "Evidence gathered so far:",
+      ...(evidence.length ? evidence.map((e) => `• ${e}`) : ["• (none gathered)"]),
+    ],
+    facts: [...episodeFacts(alert), ...recordFacts(record)],
+    links: monitorLinks(alert),
+  };
+}
+
+/** One line of evidence from a tool result, bounded so a partial message stays readable. */
+export function evidenceLine(tool: string, text: string): string {
+  const line = `${tool}: ${text.replace(/\s+/g, " ").trim()}`;
+  return line.length > LIMITS.evidenceLine ? `${line.slice(0, LIMITS.evidenceLine - 1)}…` : line;
+}
+
+/** At most this many evidence lines go on a partial message. */
+export const MAX_EVIDENCE_LINES = LIMITS.evidenceLines;
+
 function alertName(alert: Alert): string {
   return alert.title || `monitor ${alert.monitorId}`;
 }
