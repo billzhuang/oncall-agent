@@ -19,8 +19,13 @@ export interface TeamsMessage {
   title: string;
   /** Paragraphs, rendered as wrapped text blocks. */
   lines: string[];
-  /** Fact rows ("Org", "gap"). */
+  /** Fact rows ("Org", "gap"). Untrusted like all text: rendered by `plain()`. */
   facts?: Array<[string, string]>;
+  /**
+   * Fact rows the harness computes from numbers ("Model cost", "$0.03"): markdown-escaped but not defanged, so
+   * they stay readable. Never put text from an alert, Datadog or the model here.
+   */
+  measures?: Array<[string, string]>;
   /** Action links ("Open monitor"). */
   links?: Array<{ title: string; url: string }>;
 }
@@ -58,12 +63,13 @@ export async function postToTeams(env: Env, channelSecret: string, message: Team
 
 /** A URL with a scheme (`https://…`, `ftp://…`), or a scheme Teams opens without `//` (`mailto:…`). */
 const SCHEME_URL = /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s<>"']*|\b(?:mailto|tel|sms|sip|callto|skype|msteams|javascript|vbscript|data|file):[^\s<>"']*/gi;
-/** `www.` hosts, which markdown autolinks without a scheme. */
-const WWW_URL = /\bwww\.[^\s<>"']*/gi;
-/** Top-level domains a linkifier treats as links without a scheme: common generic ones and every 2-letter ccTLD. */
-const TLD = "com|net|org|edu|gov|mil|int|info|biz|pro|name|aero|asia|coop|museum|mobi|jobs|travel|app|dev|xyz|online|site|top|club|shop|cloud|[a-z]{2}";
-/** A bare domain (`evil-login.com`, `ops.evil.io`). */
-const BARE_DOMAIN = new RegExp(`\\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:${TLD})\\b`, "gi");
+/**
+ * Every dot between alphanumeric labels, so no bare domain survives whatever its TLD (`evil.support`). No TLD
+ * allowlist: version numbers and dotted identifiers read `1[.]2[.]3`, an accepted cost.
+ */
+const LABEL_DOT = /(?<=[a-z0-9-])\.(?=[a-z0-9-])/gi;
+/** Characters a linkifier may read as a dot: ideographic, fullwidth and halfwidth full stops, and other lookalikes. */
+const DOT_LOOKALIKES = /[。．｡․﹒]/g;
 
 /** Escapes markdown in one line: emphasis, code, links and images, autolinks/HTML; headings, lists, quotes. */
 function escapeMarkdownLine(line: string): string {
@@ -73,13 +79,11 @@ function escapeMarkdownLine(line: string): string {
     .replace(/^(\s*\d+)([.)])/, "$1\\$2");
 }
 
-/** Defangs URLs so no renderer finds one: `https[:]//evil[.]example/x`, `www[.]evil[.]example`, `evil-login[.]com`. */
+/** Defangs URLs so no renderer finds one: `https[:]//evil[.]example/x`, `www[.]evil[.]example`, `evil[.]support`. */
 function defang(text: string): string {
-  const dots = (s: string) => s.replace(/\./g, "[.]");
   return text
-    .replace(SCHEME_URL, (url) => dots(url.replace(":", "[:]")))
-    .replace(WWW_URL, dots)
-    .replace(BARE_DOMAIN, dots);
+    .replace(SCHEME_URL, (url) => url.replace(":", "[:]").replace(/\./g, "[.]"))
+    .replace(LABEL_DOT, "[.]");
 }
 
 /**
@@ -89,7 +93,11 @@ function defang(text: string): string {
  * line start, and never followed by an unescaped `(`. The only links in a message are the card's own actions, built by the harness from trusted URLs.
  */
 export function plain(text: string): string {
-  return defang(text.split(/\r?\n/).map(escapeMarkdownLine).join("\n"));
+  return defang(escapeMarkdown(text.replace(DOT_LOOKALIKES, ".")));
+}
+
+function escapeMarkdown(text: string): string {
+  return text.split(/\r?\n/).map(escapeMarkdownLine).join("\n");
 }
 
 function adaptiveCard(message: TeamsMessage) {
@@ -97,9 +105,11 @@ function adaptiveCard(message: TeamsMessage) {
     { type: "TextBlock", text: plain(message.title), weight: "Bolder", size: "Medium", wrap: true },
     ...message.lines.map((text) => ({ type: "TextBlock", text: plain(text), wrap: true })),
   ];
-  if (message.facts?.length) {
-    body.push({ type: "FactSet", facts: message.facts.map(([title, value]) => ({ title: plain(title), value: plain(value) })) });
-  }
+  const facts = [
+    ...(message.facts ?? []).map(([title, value]) => ({ title: plain(title), value: plain(value) })),
+    ...(message.measures ?? []).map(([title, value]) => ({ title: escapeMarkdown(title), value: escapeMarkdown(value) })),
+  ];
+  if (facts.length) body.push({ type: "FactSet", facts });
   const content: Record<string, unknown> = {
     $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
     type: "AdaptiveCard",
