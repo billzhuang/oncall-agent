@@ -8,8 +8,11 @@ import { ComputerWorkspace } from "./workspace/computer";
  * The one seam: everything outside the Worker that tests replace. Production defaults below.
  *
  * Rules: call `ports()` at the point of use and never cache its result (Durable Object instances outlive tests).
- * No code outside this module calls global `fetch`, `Date.now()` for decisions, or `createAI`.
- * Timer scheduling (Lifecycle job `time`, alarms) is the one exception: it uses real `Date.now()`.
+ * No code outside this module calls global `fetch`, `Date.now()` for decisions, or `createAI`. Two documented
+ * exceptions:
+ * - Timer scheduling (Lifecycle job `time`, alarms, backoff wake-ups) uses real `Date.now()`.
+ * - The clone in `workspace/computer.ts`: isomorphic-git calls the global `fetch` itself. Tests never reach it,
+ *   because they replace the whole workspace adapter through `ports().workspace`.
  */
 export interface Ports {
   /** Business clock: every decision (episode times, budgets, deadlines, expiry) reads it. */
