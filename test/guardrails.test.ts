@@ -28,7 +28,7 @@ describe("Cost cap", () => {
     expect(post.text).toMatch(/partial/i);
     expect(post.text).toMatch(/cost cap/i);
     expect(post.text).toContain("$3");
-    expect(post.text).toContain("NullPointerException in CheckoutController.placeOrder"); // evidence gathered so far
+    expect(post.text).toContain("NullPointerException in CheckoutController[.]placeOrder"); // evidence gathered so far
     expect(post.text).not.toContain("Investigation report:");
     expect(fakes.model.requests.length).toBeLessThan(10);
     const requests = fakes.model.requests.length;

@@ -22,6 +22,7 @@ import {
   failedMessage,
   partialMessage,
   reportMessage,
+  stoppedMessage,
   type InvestigationRecord,
   type InvestigationReport,
 } from "./report";
@@ -53,9 +54,23 @@ interface Episode {
 
 /** What a notification did, returned to intake (and Datadog) for diagnostics. */
 export type TriggerOutcome = "opened" | "joined" | "duplicate";
+/** What a Recovered did: stopped the running Investigation, only closed the Alert episode, or nothing. */
+export type RecoverOutcome = "stopped" | "closed" | "ignored" | "duplicate";
+
+type FinishedStatus = Exclude<InvestigationStatus, "Queued" | "Running">;
+const finished = (status: InvestigationStatus) => status !== "Queued" && status !== "Running";
+
+/** Why the agent's run was interrupted, recorded durably before the run is aborted. */
+export interface Interruption {
+  /** Stopped (Recovered), or Partial (cost cap, time limit). */
+  status: Extract<FinishedStatus, "Stopped" | "Partial">;
+  reason: string;
+}
 
 const EPISODE = "episode";
 const DATADOG_TOOLS = "datadog-tools";
+/** A Triggered that arrived after a Recovered, while the closed episode's run was still being stopped. */
+const PENDING_TRIGGER = "pending-trigger";
 const MAX_JOB_FAILURES = 12;
 /** How often a finalize that found the run still going looks again. Real time: it only schedules a wake-up. */
 const RUN_POLL_MS = 30_000;
@@ -64,17 +79,12 @@ const RUN_POLL_MS = 30_000;
 const reportKey = (e: Episode) => `report:${e.number}`;
 const nudgedKey = (e: Episode) => `nudged:${e.number}`;
 const costBaselineKey = (e: Episode) => `cost-baseline:${e.number}`;
-/** Set when the run is interrupted (cost cap, time limit): `{ reason, at }`. The first reason wins. */
 const interruptedKey = (e: Episode) => `interrupted:${e.number}`;
+const freshContextKey = (e: Episode) => `fresh-context:${e.number}`;
 /** Set once the agent's one input was submitted. */
 const submittedKey = (e: Episode) => `submitted:${e.number}`;
 /** Evidence gathered by the agent's tools, one key per tool call so parallel and replayed calls never clash. */
 const evidencePrefix = (e: Episode) => `evidence:${e.number}:`;
-
-interface Interruption {
-  reason: string;
-  at: number;
-}
 /** The agent's one submission per Alert episode; pi ignores a second submit with the same id. */
 const operationId = (e: Episode) => `episode:${e.number}`;
 
@@ -110,17 +120,87 @@ export class Investigation extends DurableObject<Env> {
       await this.#save(current);
       return "joined";
     }
-    const episode: Episode = {
-      number: (current?.number ?? 0) + 1,
-      alert,
-      openedAt: now,
-      status: "Queued",
-      retriggers: 0,
-      lastTriggeredAt: now,
-    };
+    if (current && !finished(current.status)) {
+      // Recovered, but its run is still being stopped: open the next Alert episode once it has finished.
+      if (await this.ctx.storage.get(PENDING_TRIGGER)) return "joined";
+      await this.ctx.storage.put(PENDING_TRIGGER, alert);
+      return "opened";
+    }
+    await this.#open(alert, (current?.number ?? 0) + 1);
+    return "opened";
+  }
+
+  /**
+   * A Recovered notification: closes the open Alert episode. A running Investigation is stopped (Stopped) and
+   * the stopped on recovery note posted; a finished one is left as it is. An Agent PR already opened stays.
+   */
+  async recovered(alert: Alert): Promise<RecoverOutcome> {
+    await this.lifecycle.start();
+    if (!(await this.#firstDelivery(alert))) return "duplicate";
+    if (await this.ctx.storage.get(PENDING_TRIGGER)) {
+      // The next Alert episode recovered before it opened.
+      await this.ctx.storage.delete(PENDING_TRIGGER);
+      return "closed";
+    }
+    const episode = await this.#episode();
+    if (!episode || episode.closedAt !== undefined) return "ignored";
+    episode.closedAt = ports().now();
+    await this.#save(episode);
+    if (episode.status === "Queued") {
+      await this.#finish(episode, "Stopped", await this.#record(episode), "the monitor recovered before it started");
+      return "closed";
+    }
+    if (episode.status !== "Running") return "closed";
+    await this.interrupt({ status: "Stopped", reason: "the monitor recovered" });
+    return "stopped";
+  }
+
+  /**
+   * Interrupts the running agent: records why first (durable, so a crash before the abort is caught by
+   * `#finalize`), aborts the run, then lets `#finalize` post the message and finish the Investigation.
+   * Call from an RPC or `onAlarm`, or un-awaited from a hook: abort waits for the run to go idle.
+   */
+  private async interrupt(reason: Interruption): Promise<void> {
+    if (!(await this.#flagInterruption(reason))) return;
+    await this.harness.abort();
+    await this.#scheduleFinalize();
+  }
+
+  /**
+   * `interrupt` for the run's own hooks and for alarms: records why, then aborts without waiting, since abort
+   * waits for the run to go idle. `#finalize` re-aborts if an eviction came between the flag and the abort.
+   */
+  async #interruptFromRun(reason: Interruption): Promise<void> {
+    if (!(await this.#flagInterruption(reason))) return;
+    void this.harness
+      .abort()
+      .then(() => this.#scheduleFinalize())
+      .catch((error) => console.error(`Investigation ${this.lifecycle.name}: abort failed`, error));
+  }
+
+  /** Records why the run is interrupted (the first reason wins); false when no Investigation is running. */
+  async #flagInterruption(reason: Interruption): Promise<boolean> {
+    const episode = await this.#episode();
+    if (!episode || finished(episode.status)) return false;
+    if (!(await this.ctx.storage.get(interruptedKey(episode)))) await this.ctx.storage.put(interruptedKey(episode), reason);
+    return true;
+  }
+
+  /** Opens an Alert episode and starts its Investigation. */
+  async #open(alert: Alert, number: number): Promise<void> {
+    const now = ports().now();
+    const episode: Episode = { number, alert, openedAt: now, status: "Queued", retriggers: 0, lastTriggeredAt: now };
     await this.#save(episode);
     await this.#start(episode);
-    return "opened";
+  }
+
+  /** Opens the Alert episode of a Triggered that arrived while the previous episode was being stopped. */
+  async #openPending(): Promise<void> {
+    const alert = await this.ctx.storage.get<Alert>(PENDING_TRIGGER);
+    if (!alert) return;
+    const current = await this.#episode();
+    if (!current || finished(current.status)) await this.#open(alert, (current?.number ?? 0) + 1);
+    await this.ctx.storage.delete(PENDING_TRIGGER);
   }
 
   /** Records a webhook delivery; false when it was seen before (a Datadog retry). */
@@ -154,13 +234,14 @@ export class Investigation extends DurableObject<Env> {
     if (!episode || episode.status !== "Running" || episode.startedAt === undefined) return;
     const { budgets } = ports().config(this.env);
     if (ports().now() - episode.startedAt < budgets.investigationMinutes * 60_000) return;
-    await this.#interrupt(`time limit of ${budgets.investigationMinutes} minutes reached`);
+    await this.#interruptFromRun({ status: "Partial", reason: `time limit of ${budgets.investigationMinutes} minutes reached` });
   }
 
   async onJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
     if (job.fn === "deadline") return this.#checkDeadline();
     if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run());
     if (job.fn === "finalize") return this.#withBackoff(job.id, () => this.#finalize());
+    if (job.fn === "open-pending") return this.#withBackoff(job.id, () => this.#openPending());
   }
 
   /**
@@ -170,6 +251,7 @@ export class Investigation extends DurableObject<Env> {
   async #run(): Promise<void> {
     const episode = await this.#episode();
     if (!episode || episode.status !== "Running") return;
+    if (await this.ctx.storage.get(interruptedKey(episode))) return; // interrupted before the agent got its input
     const config = ports().config(this.env);
     if (!modelAvailable(this.env, config.modelId)) {
       return this.#endWithoutReport(episode, `the configured model ${config.modelId} is not available`);
@@ -177,7 +259,11 @@ export class Investigation extends DurableObject<Env> {
     const specs = await this.datadog.listReadOnlyTools(config.datadog.tools);
     await this.ctx.storage.put(DATADOG_TOOLS, specs);
     installDatadogTools(this.#agentHost(), specs);
-    // TODO(#3): a later Alert episode in this object reuses the root session; start it on a fresh context.
+    // A later Alert episode starts the root session on a fresh context, once (never mid-run, on a replay).
+    if (episode.number > 1 && !(await this.ctx.storage.get(freshContextKey(episode)))) {
+      await this.harness.session().reset();
+      await this.ctx.storage.put(freshContextKey(episode), true);
+    }
     await this.harness.session().setModel({ provider: MODEL_PROVIDER, id: config.modelId });
     if ((await this.ctx.storage.get(costBaselineKey(episode))) === undefined) {
       await this.ctx.storage.put(costBaselineKey(episode), await this.#spentUsd());
@@ -190,20 +276,21 @@ export class Investigation extends DurableObject<Env> {
   }
 
   /**
-   * Once the agent's run has ended: posts the Investigation report, or the failed message when the run ended
-   * without one, and finishes the Investigation. Safe to re-run.
+   * Once the agent's run has ended: posts the Investigation report, or the message for an interrupted run, or
+   * the failed message when the run ended without a report, and finishes the Investigation. Safe to re-run.
    */
   async #finalize(): Promise<void | { rescheduleAt: number }> {
     const episode = await this.#episode();
     if (!episode || episode.status !== "Running") return;
-    const running = (await this.harness.pending()).some((p) => p.operationId === operationId(episode));
     const interruption = await this.ctx.storage.get<Interruption>(interruptedKey(episode));
+    const running = (await this.harness.pending()).some((p) => p.operationId === operationId(episode));
     if (running) {
-      if (interruption) this.#abortRun(); // again: an eviction may have come between the flag and the abort
+      if (interruption) await this.harness.abort(); // a crash came between the durable flag and the abort
       return { rescheduleAt: Date.now() + RUN_POLL_MS };
     }
-    if (interruption) return this.#endInterrupted(episode, interruption);
     const report = await this.ctx.storage.get<InvestigationReport>(reportKey(episode));
+    // A report submitted before the interruption landed wins: the agent had finished its work.
+    if (!report && interruption) return this.#endInterrupted(episode, interruption);
     if (!report) return this.#endWithoutReport(episode, await this.#runEndReason(episode));
     const record = await this.#record(episode);
     await this.#notify(episode, "report", reportMessage(episode.alert, report, record));
@@ -211,36 +298,15 @@ export class Investigation extends DurableObject<Env> {
   }
 
   /**
-   * Stops the agent's run, e.g. on the cost cap or time limit: records why (durably, first reason wins), then
-   * aborts without waiting, since abort waits for the run to go idle and may be called from the run's own hooks.
-   * Once the run has stopped, `finalize` posts the outcome.
+   * The run was interrupted before it submitted a report: posts the stopped on recovery note, or (cost cap,
+   * time limit) the partial message with the evidence gathered so far, and finishes the Investigation.
    */
-  async interrupt(reason: string): Promise<void> {
-    await this.lifecycle.start();
-    await this.#interrupt(reason);
-  }
-
-  async #interrupt(reason: string): Promise<void> {
-    const episode = await this.#episode();
-    if (!episode || episode.status !== "Running") return;
-    const key = interruptedKey(episode);
-    if (!(await this.ctx.storage.get(key))) {
-      await this.ctx.storage.put(key, { reason, at: ports().now() } satisfies Interruption);
-    }
-    this.#abortRun();
-  }
-
-  /** Aborts the agent's run without awaiting it, then has `finalize` look at once. */
-  #abortRun(): void {
-    void this.harness
-      .abort()
-      .then(() => this.#scheduleFinalize())
-      .catch((error) => console.error(`Investigation ${this.lifecycle.name}: abort failed`, error));
-  }
-
-  /** A guardrail stopped the run: post the partial message with the evidence so far, and finish Partial. */
   async #endInterrupted(episode: Episode, interruption: Interruption): Promise<void> {
     const record = await this.#record(episode);
+    if (interruption.status === "Stopped") {
+      await this.#notify(episode, "stopped", stoppedMessage(episode.alert, record));
+      return this.#finish(episode, "Stopped", record, interruption.reason);
+    }
     const evidence = await this.ctx.storage.list<{ at: number; line: string }>({ prefix: evidencePrefix(episode) });
     const lines = [...evidence.values()]
       .sort((a, b) => a.at - b.at)
@@ -273,7 +339,7 @@ export class Investigation extends DurableObject<Env> {
    */
   async #finish(
     episode: Episode,
-    status: Exclude<InvestigationStatus, "Queued" | "Running">,
+    status: FinishedStatus,
     record: InvestigationRecord,
     reason?: string,
   ): Promise<void> {
@@ -285,6 +351,7 @@ export class Investigation extends DurableObject<Env> {
     current.durationMs = record.durationMs;
     if (reason !== undefined) current.reason = reason;
     await this.#save(current);
+    await this.lifecycle.jobs.cancel("deadline");
     await this.datadog.close();
     console.log(
       JSON.stringify({
@@ -300,6 +367,9 @@ export class Investigation extends DurableObject<Env> {
         durationMs: record.durationMs,
       }),
     );
+    if (await this.ctx.storage.get(PENDING_TRIGGER)) {
+      await this.lifecycle.jobs.push({ id: "open-pending", fn: "open-pending", time: Date.now() });
+    }
   }
 
   /** Model spend of this Alert episode so far, and its duration since it started running. */
@@ -391,7 +461,7 @@ export class Investigation extends DurableObject<Env> {
           maxMinutes: budgets.investigationMinutes,
         };
       },
-      interrupt: (reason) => this.#interrupt(reason),
+      interrupt: (reason) => this.#interruptFromRun({ status: "Partial", reason }),
       evidenceGathered: async (callId, tool, text) => {
         const key = `${evidencePrefix(await current())}${callId}`;
         if (await storage.get(key)) return;
