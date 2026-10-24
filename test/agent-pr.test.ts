@@ -247,7 +247,7 @@ describe("Agent PR", () => {
     expect(report).not.toContain("README.md"); // changed on main, but not by the agent
   });
 
-  it("gives no drift warning when main changed only files the agent did not touch", async () => {
+  it("opens the PR when main changed only files the agent did not touch", async () => {
     const { service, repo } = deployedService({ main: { ...FILES, "src/cart.ts": "export const cart = { total: 1 };\n" } });
     fakes.model.script(fixScript());
 
@@ -255,7 +255,6 @@ describe("Agent PR", () => {
 
     await waitFor(() => expect(reports()).toHaveLength(1));
     const [pr] = fakes.github.pulls(repo);
-    expect(pr!.body).not.toMatch(/drift/i);
     expect(fakes.github.files(repo, pr!.head)).toEqual({ ...FILES, "src/cart.ts": "export const cart = { total: 1 };\n", "src/checkout.ts": FIXED });
   });
 

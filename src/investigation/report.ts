@@ -133,7 +133,7 @@ function agentPrLine(pr: AgentPrRecord): string {
 }
 
 /**
- * The Agent PR description, in GitHub markdown. Harness facts (monitor link, Owning team, drift warning) are built
+ * The Agent PR description, in GitHub markdown. Harness facts (monitor link, Owning team, deployed commit) are built
  * here; everything the model wrote, and every name from the alert or the workspace, is rendered as code, where
  * GitHub makes no links, @mentions, #references or HTML.
  */
