@@ -49,6 +49,12 @@ interface RepoState {
   /** `heads/<branch>` -> commit sha. */
   refs: Map<string, string>;
   pulls: Pull[];
+  /** The compare API leaves files out, as GitHub's does past 300 files. */
+  truncatedCompare?: boolean;
+  /** The contents API answers 500. */
+  contentsDown?: boolean;
+  /** Runs once, right before the next GraphQL ref update is applied (a Code owner pushing at that moment). */
+  beforeRefUpdate?: () => void;
 }
 
 /** The owner whose repos the test GitHub App is installed on by default (all repos). */
@@ -94,14 +100,32 @@ function isAncestor(repo: RepoState, ancestor: string, of: string): boolean {
   return false;
 }
 
+const ZERO_OID = "0".repeat(40);
+/** The GraphQL node id the fake gives a repo (`owner/name`, lower case). */
+const nodeId = (full: string) => `R_fake_${full.toLowerCase()}`;
+
+/** A blob's object id from its content, as git's is: the same content has the same id in every commit. */
+function blobSha(content: string): string {
+  let a = 0x811c9dc5;
+  let b = 0x01000193;
+  for (let i = 0; i < content.length; i++) {
+    a = Math.imul(a ^ content.charCodeAt(i), 0x01000193) >>> 0;
+    b = Math.imul(b ^ content.charCodeAt(i), 0x5bd1e995) >>> 0;
+  }
+  return `b${a.toString(16).padStart(8, "0")}${b.toString(16).padStart(8, "0")}${content.length.toString(16).padStart(23, "0")}`;
+}
+
+/** Stores a blob and returns its content-addressed id. */
+function putBlob(repo: RepoState, content: string): string {
+  const sha = blobSha(content);
+  repo.blobs.set(sha, content);
+  return sha;
+}
+
 /** Adds a commit with these files (flat tree) to a repo. */
 function addCommit(repo: RepoState, sha: string, files: Record<string, string>, parents: string[], message: string): void {
   const tree: Record<string, string> = {};
-  for (const [path, content] of Object.entries(files)) {
-    const blob = nextSha();
-    repo.blobs.set(blob, content);
-    tree[path] = blob;
-  }
+  for (const [path, content] of Object.entries(files)) tree[path] = putBlob(repo, content);
   const treeSha = nextSha();
   repo.trees.set(treeSha, tree);
   repo.commits.set(sha, { tree: treeSha, parents, message });
@@ -177,9 +201,15 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
     }
     if (method === "POST" && route === "git/blobs") {
       const content = body.encoding === "base64" ? decodeBase64(String(body.content)) : String(body.content);
-      const sha = nextSha();
-      repo.blobs.set(sha, content);
-      return Response.json({ sha }, { status: 201 });
+      return Response.json({ sha: putBlob(repo, content) }, { status: 201 });
+    }
+    if (method === "GET" && (m = route.match(/^contents\/(.+)$/))) {
+      if (repo.contentsDown) return Response.json({ message: "Server Error" }, { status: 500 });
+      const commit = resolve(repo, query.get("ref") ?? "main");
+      if (!commit) return notFound();
+      const path = decodeURIComponent(m[1]!);
+      const blob = repo.trees.get(repo.commits.get(commit)!.tree)![path];
+      return blob ? Response.json({ type: "file", path, sha: blob }) : notFound();
     }
     if (method === "POST" && route === "git/trees") {
       const base = body.base_tree ? repo.trees.get(body.base_tree) : {};
@@ -272,7 +302,8 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
       const files = paths
         .filter((p) => a[p] !== b[p])
         .map((filename) => ({ filename, status: !(filename in a) ? "added" : !(filename in b) ? "removed" : "modified" }));
-      return Response.json({ status: "ahead", files });
+      // GitHub lists at most 300 files: a truncated compare leaves some out, silently.
+      return Response.json({ status: "ahead", files: repo.truncatedCompare ? [] : files });
     }
     return notFound();
   };
@@ -323,6 +354,56 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
         );
       }
 
+      const lose = () => {
+        const loss = losses.findIndex((l) => l.method === request.method && l.path.test(url.pathname));
+        if (loss < 0) return;
+        const [{ reached }] = losses.splice(loss, 1) as [(typeof losses)[number]];
+        reached();
+        throw new Error(`connection reset before GitHub's answer to ${request.method} ${url.pathname} arrived`);
+      };
+
+      const repoOnly = url.pathname.match(/^\/repos\/([^/]+)\/([^/]+)$/);
+      const known = repoOnly && repos.get(`${repoOnly[1]}/${repoOnly[2]}`.toLowerCase());
+      if (request.method === "GET" && repoOnly && known) {
+        const full = `${repoOnly[1]}/${repoOnly[2]}`;
+        const problem = tokenProblem(request.headers.get("authorization"), repoOnly[2]!, "contents", "read");
+        if (problem) {
+          authErrors.push(`GET ${url.pathname}: ${problem}`);
+          return Response.json({ message: problem }, { status: 401 });
+        }
+        return Response.json({ full_name: full, node_id: nodeId(full), default_branch: "main" });
+      }
+
+      // GraphQL: only the updateRefs mutation the harness uses, with its compare-and-swap on beforeOid.
+      if (request.method === "POST" && url.pathname === "/graphql") {
+        const { query, variables } = JSON.parse(text) as { query: string; variables: { input: any } };
+        if (!/mutation[\s\S]*updateRefs\(/.test(query)) return Response.json({ errors: [{ message: "unsupported query" }] });
+        const full = [...repos.keys()].find((f) => nodeId(f) === variables.input.repositoryId);
+        if (!full) return Response.json({ data: { updateRefs: null }, errors: [{ type: "NOT_FOUND", message: "repository not found" }] });
+        const repo = repos.get(full)!;
+        const problem = tokenProblem(request.headers.get("authorization"), full.split("/")[1]!, "contents", "write");
+        if (problem) {
+          authErrors.push(`POST /graphql: ${problem}`);
+          return Response.json({ message: problem }, { status: 401 });
+        }
+        repo.beforeRefUpdate?.();
+        repo.beforeRefUpdate = undefined;
+        const updates = variables.input.refUpdates as Array<{ name: string; beforeOid?: string; afterOid: string; force?: boolean }>;
+        for (const u of updates) {
+          const current = repo.refs.get(u.name.replace(/^refs\//, "")) ?? ZERO_OID;
+          if (u.beforeOid !== undefined && u.beforeOid !== current) {
+            return Response.json({ data: { updateRefs: null }, errors: [{ type: "UNPROCESSABLE", message: `${u.name} is at ${current}, not ${u.beforeOid}` }] });
+          }
+          if (!repo.commits.has(u.afterOid)) return Response.json({ data: { updateRefs: null }, errors: [{ message: "Object does not exist" }] });
+        }
+        for (const u of updates) {
+          repo.refs.set(u.name.replace(/^refs\//, ""), u.afterOid);
+          refWrites.push({ repo: full, method: "GRAPHQL", ref: u.name, sha: u.afterOid });
+        }
+        lose();
+        return Response.json({ data: { updateRefs: { clientMutationId: null } } });
+      }
+
       const rest = url.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/(.+)$/);
       const repo = rest && repos.get(`${rest[1]}/${rest[2]}`.toLowerCase());
       if (rest && repo) {
@@ -337,12 +418,7 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
         }
         const body = (text ? JSON.parse(text) : {}) as Record<string, any>;
         const response = repoRoute(`${owner}/${name}`, repo, request.method, route, url.searchParams, body);
-        const loss = losses.findIndex((l) => l.method === request.method && l.path.test(url.pathname));
-        if (loss >= 0) {
-          const [{ reached }] = losses.splice(loss, 1) as [(typeof losses)[number]];
-          reached();
-          throw new Error(`connection reset before GitHub's answer to ${request.method} ${url.pathname} arrived`);
-        }
+        lose();
         return response;
       }
       return Response.json({ message: "Not Found" }, { status: 404 });
@@ -390,6 +466,18 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
       addCommit(repo, sha, { ...filesOf(repo, parent), ...files }, [parent], "a Code owner's follow-up");
       repo.refs.set(`heads/${branch}`, sha);
       return sha;
+    },
+    /** Makes the compare API of a repo leave files out, as GitHub's does past 300 changed files. */
+    truncateCompare(full: string) {
+      repos.get(full.toLowerCase())!.truncatedCompare = true;
+    },
+    /** Makes the contents API of a repo answer 500. */
+    contentsDown(full: string) {
+      repos.get(full.toLowerCase())!.contentsDown = true;
+    },
+    /** Runs `fn` right before the next GraphQL ref update of a repo is applied. */
+    beforeNextRefUpdate(full: string, fn: () => void) {
+      repos.get(full.toLowerCase())!.beforeRefUpdate = fn;
     },
     /** A Code owner closes a pull request. */
     closePull(full: string, number: number) {

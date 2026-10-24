@@ -326,6 +326,100 @@ describe("Agent PR", () => {
     expect(report).toContain(`https://github.com/${repo}/pull/${pr!.number}`);
   });
 
+  /** Episode 1 opens the Agent PR; returns what a test needs to drive episode 2 of the same monitor group. */
+  async function openedAgentPr() {
+    const { service, repo } = deployedService();
+    const second = fixScript({ edits: [["write", { path: "src/guard.ts", content: "export const guard = 1;\n" }]] });
+    fakes.model.script((t) => (t.alert.includes("second episode") ? second(t) : fixScript()(t)));
+    const opened = alertFor(service);
+    await sendWebhook(opened);
+    await waitFor(() => expect(reports()).toHaveLength(1));
+    const [pr] = fakes.github.pulls(repo);
+    const secondEpisode = async () => {
+      await sendWebhook({ ...opened, alertId: `${opened.alertId}-r`, transition: "Recovered" });
+      await sendWebhook({ ...opened, alertId: `${opened.alertId}-2`, title: "[Triggered] second episode of checkout errors" });
+    };
+    return { repo, pr: pr!, alert: opened, secondEpisode };
+  }
+
+  /** The second episode left the branch at the Code owner's commit, commented once, and the report says why. */
+  function expectLeftAlone(repo: string, pr: { head: string; number: number }, humanHead: string, writesBefore: number) {
+    expect(fakes.github.refWrites).toHaveLength(writesBefore);
+    expect(fakes.github.commit(repo, pr.head)!.sha).toBe(humanHead);
+    const { comments } = fakes.github.pulls(repo)[0]!;
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("not pushed");
+    const report = shown(reports()[1]!.text);
+    expect(report).toContain("commits not made by the oncall agent");
+    expect(report).toContain(`https://github.com/${repo}/pull/${pr.number}`);
+  }
+
+  it("checks the branch again before pushing on a replay: a Code owner's commit pushed meanwhile is never forced over", async () => {
+    const { repo, pr, alert, secondEpisode } = await openedAgentPr();
+    const writesBefore = fakes.github.refWrites.length;
+    // Episode 2 records its commit, then loses GitHub's answer to the branch check right before the push.
+    const loss = fakes.github.loseAnswer("GET", /\/git\/ref\/heads\/oncall-agent\//);
+
+    await secondEpisode();
+    await waitFor(() => expect(loss.lost()).toBe(true));
+    const humanHead = fakes.github.pushHumanCommit(repo, pr.head, { "src/checkout.ts": `${FIXED}// reviewed\n` });
+    await abortAllDurableObjects(); // and evicted: the retry is a replay
+    await waitFor(
+      async () => {
+        await runDurableObjectAlarm(investigationOf(alert));
+        expect(reports()).toHaveLength(2);
+      },
+      { interval: 200 },
+    );
+    await settle();
+
+    expectLeftAlone(repo, pr, humanHead, writesBefore);
+  });
+
+  it("never forces over a Code owner's commit that lands between the branch check and the push (compare-and-swap)", async () => {
+    const { repo, pr, secondEpisode } = await openedAgentPr();
+    const writesBefore = fakes.github.refWrites.length;
+    let humanHead = "";
+    fakes.github.beforeNextRefUpdate(repo, () => {
+      humanHead = fakes.github.pushHumanCommit(repo, pr.head, { "src/checkout.ts": `${FIXED}// reviewed\n` });
+    });
+
+    await secondEpisode();
+
+    await waitFor(() => expect(reports()).toHaveLength(2));
+    await settle();
+    expectLeftAlone(repo, pr, humanHead, writesBefore);
+  });
+
+  it("finds drift even when GitHub's compare leaves the drifted file out (it lists at most 300 files)", async () => {
+    const onMain = CHECKOUT.replace("const total = cart.total;", "const total = cart.total ?? 0;");
+    const { service, repo } = deployedService({ main: { ...FILES, "src/checkout.ts": onMain } });
+    fakes.github.truncateCompare(repo);
+    fakes.model.script(fixScript());
+
+    await sendWebhook(alertFor(service));
+
+    await waitFor(() => expect(reports()).toHaveLength(1));
+    await settle();
+    expect(fakes.github.pulls(repo)).toEqual([]);
+    expect(fakes.github.refWrites).toEqual([]);
+    expect(shown(reports()[0]!.text)).toMatch(/changed on main since the deployed commit.*: src\/checkout\.ts\./);
+  });
+
+  it("treats a file it cannot compare between the deployed commit and main as drifted: no PR", async () => {
+    const { service, repo } = deployedService();
+    fakes.github.contentsDown(repo);
+    fakes.model.script(fixScript());
+
+    await sendWebhook(alertFor(service));
+
+    await waitFor(() => expect(reports()).toHaveLength(1));
+    await settle();
+    expect(fakes.github.pulls(repo)).toEqual([]);
+    expect(fakes.github.refWrites).toEqual([]);
+    expect(shown(reports()[0]!.text)).toContain("src/checkout.ts");
+  });
+
   it("links the open Agent PR of the monitor group from a later Alert episode without a fix, until it is closed", async () => {
     const { service, repo } = deployedService();
     fakes.model.script((t) => (t.alert.includes("later episode") ? fixScript({ fixProposed: false, edits: [] })(t) : fixScript()(t)));
@@ -352,7 +446,7 @@ describe("Agent PR", () => {
   });
 
   it.each([
-    ["the branch was created", "POST", /\/git\/refs$/],
+    ["the branch was created", "POST", /^\/graphql$/],
     ["the PR was opened", "POST", /\/pulls$/],
   ])("never duplicates the branch or the PR when evicted right after %s", async (_, method, path) => {
     const { service, repo } = deployedService();
@@ -380,7 +474,7 @@ describe("Agent PR", () => {
     const [pr] = fakes.github.pulls(repo);
     expect(fakes.github.branches(repo).filter((b) => b.startsWith("oncall-agent/"))).toEqual([pr!.head]);
     expect(fakes.github.calls.filter((c) => c.method === "POST" && c.path.endsWith("/pulls"))).toHaveLength(1);
-    expect(fakes.github.calls.filter((c) => c.method === "POST" && c.path.endsWith("/git/refs"))).toHaveLength(1);
+    expect(fakes.github.refWrites).toHaveLength(1);
     expect(fakes.github.files(repo, pr!.head)!["src/checkout.ts"]).toBe(FIXED);
     expect(reports()[0]!.text).toContain(`https://github.com/${repo}/pull/${pr!.number}`);
     expect(reports()[0]!.text).toContain("opened draft Agent PR");

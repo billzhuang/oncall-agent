@@ -195,19 +195,22 @@ async function pushAgentPr(
     let commit = await store.get<{ sha: string }>("commit");
     if (!commit) {
       const main = await github.branchHead(BASE_BRANCH);
-      const changedOnMain = new Set(await github.changedFiles(fix.deployedSha, main.sha));
-      const drifted = changes.map((c) => c.path).filter((p) => changedOnMain.has(p));
+      const drifted = await driftedPaths(github, changes, fix.deployedSha, main.sha);
       if (drifted.length) return { outcome: "drifted", paths: drifted };
-      const head = await github.branchSha(branch);
-      const ours = await store.branchState();
-      const lastPushed = ours && repoName(ours.repo).toLowerCase() === repoName(repo).toLowerCase() ? ours.sha : undefined;
-      if (head !== undefined && head !== lastPushed) return await leaveBranchAlone(github, fix, branch);
       const message = `Proposed fix for monitor ${alert.monitorId} (${alert.org}) by the oncall agent`;
       commit = { sha: await github.commit(main, changes, message) };
       await store.put("commit", commit);
     }
     if (!(await store.get("branch"))) {
-      await github.pushAgentBranch(branch, commit.sha);
+      // Looked at right before every push, replays included: the branch must hold only what the harness pushed.
+      const head = await github.branchSha(branch);
+      if (head !== commit.sha) {
+        const ours = await store.branchState();
+        const lastPushed = ours && repoName(ours.repo).toLowerCase() === repoName(repo).toLowerCase() ? ours.sha : undefined;
+        if (head !== undefined && head !== lastPushed) return await leaveBranchAlone(github, fix, branch);
+        // Compare-and-swap: a commit pushed between the look and the move makes GitHub refuse it.
+        if (!(await github.moveAgentBranch(branch, head, commit.sha))) return await leaveBranchAlone(github, fix, branch);
+      }
       const previous = await store.branchState();
       await store.setBranchState({ ...previous, repo, branch, sha: commit.sha });
       await store.put("branch", { branch, sha: commit.sha });
@@ -237,6 +240,24 @@ async function pushAgentPr(
     if (error instanceof Error) error.message = scrubSecret(error.message, token);
     throw error;
   }
+}
+
+/**
+ * The changed paths whose file differs between the deployed commit and `main` (by blob id, one path at a time).
+ * Fails closed: a path whose lookup fails counts as drifted.
+ */
+async function driftedPaths(github: RepoClient, changes: readonly FileChange[], deployedSha: string, mainSha: string): Promise<string[]> {
+  const drifted: string[] = [];
+  for (const { path } of changes) {
+    try {
+      const [deployed, onMain] = await Promise.all([github.blobAt(path, deployedSha), github.blobAt(path, mainSha)]);
+      if (deployed !== onMain) drifted.push(path);
+    } catch (error) {
+      console.warn(`Agent PR: could not compare ${path} with main, so it counts as drifted: ${errorMessage(error)}`);
+      drifted.push(path);
+    }
+  }
+  return drifted;
 }
 
 /**

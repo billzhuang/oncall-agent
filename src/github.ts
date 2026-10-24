@@ -8,6 +8,8 @@ import { scrubSecret } from "./text";
  */
 
 const API = "https://api.github.com";
+/** The object id GraphQL `updateRefs` takes as "this ref must not exist yet". */
+const ZERO_OID = "0".repeat(40);
 
 /** A GitHub repository, `owner/name`. */
 export interface RepoRef {
@@ -110,13 +112,23 @@ export class RepoClient {
     return { sha: ref.object.sha, treeSha: commit.tree.sha };
   }
 
-  /** Paths that differ between two commits or branches (`base...head`). */
-  async changedFiles(base: string, head: string): Promise<string[]> {
-    const compare = await this.#call<{ files?: Array<{ filename: string; previous_filename?: string }> }>(
+  /**
+   * The blob id of `path` at a commit (`null` when no file is there), from the contents API: one path at a time, so
+   * nothing is silently left out the way the compare API's 300-file limit does. Throws on any other answer.
+   */
+  async blobAt(path: string, commit: string): Promise<string | null> {
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    const entry = await this.#call<{ type?: string; sha?: string } | unknown[] | undefined>(
       "GET",
-      `compare/${base}...${head}`,
+      `contents/${encoded}?ref=${encodeURIComponent(commit)}`,
+      undefined,
+      [404],
     );
-    return (compare.files ?? []).flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
+    if (entry === undefined) return null;
+    if (Array.isArray(entry) || entry.type !== "file" || typeof entry.sha !== "string") {
+      throw new GitHubError(422, `${path} at ${commit} is not a file`);
+    }
+    return entry.sha;
   }
 
   /** One commit on top of `parent`: its tree with `changes` applied (`content: null` deletes the file). */
@@ -140,22 +152,34 @@ export class RepoClient {
   }
 
   /**
-   * Points an `oncall-agent/*` branch at `sha`: creates it, or moves it (force) when it exists. Idempotent: a
-   * branch already at `sha` is left alone. Refuses any other branch. The caller first checks that the branch holds
-   * only the harness's own commit (see `pushAgentPr`), so nothing a Code owner pushed is ever forced over.
+   * Points an `oncall-agent/*` branch at `sha` only if it still points at `expected` (undefined: only if it does not
+   * exist yet): a compare-and-swap, GraphQL `updateRefs` with `beforeOid`, so a commit someone pushed after the
+   * caller looked is never forced over. Returns false when the branch had moved (nothing was written). Refuses any
+   * other branch.
    */
-  async pushAgentBranch(branch: string, sha: string): Promise<void> {
+  async moveAgentBranch(branch: string, expected: string | undefined, sha: string): Promise<boolean> {
     if (!branch.startsWith(AGENT_BRANCH_PREFIX) || branch.includes("..")) {
       throw new Error(`refusing to write branch ${branch}: the harness writes only ${AGENT_BRANCH_PREFIX}* branches`);
     }
-    const current = await this.#call<{ object: { sha: string } } | undefined>("GET", `git/ref/heads/${branch}`, undefined, [404]);
-    if (current?.object.sha === sha) return;
-    if (!current) {
-      const created = await this.#call("POST", "git/refs", { ref: `refs/heads/${branch}`, sha }, [422]);
-      if (created !== undefined) return;
-      // 422: created meanwhile (a replayed step); move it instead.
-    }
-    await this.#call("PATCH", `git/refs/heads/${branch}`, { sha, force: true });
+    const repository = await this.#request<{ node_id: string }>("GET", `${API}/repos/${this.repo.owner}/${this.repo.name}`);
+    const answer = await this.#request<{ data?: { updateRefs?: unknown } | null; errors?: Array<{ message?: string }> }>(
+      "POST",
+      `${API}/graphql`,
+      {
+        query: "mutation($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }",
+        variables: {
+          input: {
+            repositoryId: repository.node_id,
+            refUpdates: [{ name: `refs/heads/${branch}`, beforeOid: expected ?? ZERO_OID, afterOid: sha, force: true }],
+          },
+        },
+      },
+    );
+    if (!answer.errors?.length && answer.data?.updateRefs) return true;
+    // Refused: if the branch is no longer where we expected, someone else moved it; anything else is an error.
+    if ((await this.branchSha(branch)) !== expected) return false;
+    const reason = (answer.errors ?? []).map((e) => e.message ?? "").join("; ") || "no answer";
+    throw new GitHubError(502, `GitHub refused to move ${branch} on ${repoName(this.repo)}: ${scrubSecret(reason, this.#token).slice(0, 200)}`);
   }
 
   /** The commit a branch points at, or undefined when there is no such branch. */
@@ -198,9 +222,15 @@ export class RepoClient {
     return this.#call<{ number: number; html_url: string }>("PATCH", `pulls/${number}`, input);
   }
 
-  /** One REST call; `tolerate` lists statuses answered with undefined instead of an error. */
+  /** One REST call on the repo; `tolerate` lists statuses answered with undefined instead of an error. */
   async #call<T = unknown>(method: string, path: string, body?: unknown, tolerate: number[] = []): Promise<T> {
-    const res = await ports().fetch(`${API}/repos/${this.repo.owner}/${this.repo.name}/${path}`, {
+    return this.#request<T>(method, `${API}/repos/${this.repo.owner}/${this.repo.name}/${path}`, body, tolerate);
+  }
+
+  /** One call to the GitHub API with the installation token. Errors never carry the token. */
+  async #request<T>(method: string, url: string, body?: unknown, tolerate: number[] = []): Promise<T> {
+    const path = url.slice(API.length + 1);
+    const res = await ports().fetch(url, {
       method,
       headers: {
         ...HEADERS,
