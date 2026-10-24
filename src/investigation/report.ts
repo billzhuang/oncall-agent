@@ -65,6 +65,19 @@ export function failedMessage(alert: Alert, reason: string, record: Investigatio
   };
 }
 
+/** The one notice for an Alert episode not investigated because the daily budget is exhausted. */
+export function budgetExhaustedMessage(alert: Alert): TeamsMessage {
+  return {
+    title: `Budget exhausted, not investigated: ${alertName(alert)}`,
+    lines: [
+      "The oncall agent's daily spend budget is exhausted, so this alert was not investigated. " +
+        "Please investigate it yourself. The budget resets at 00:00 UTC.",
+    ],
+    facts: episodeFacts(alert),
+    links: monitorLinks(alert),
+  };
+}
+
 function alertName(alert: Alert): string {
   return alert.title || `monitor ${alert.monitorId}`;
 }

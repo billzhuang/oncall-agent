@@ -3,6 +3,8 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
 import { orgByName, type Org } from "../config";
+import type { InvestigationRef } from "../coordinator";
+import { coordinatorStub } from "../durable";
 import { DatadogConnection, type DatadogToolSpec } from "../datadog-mcp";
 import type { Alert } from "../intake";
 import { ports } from "../ports";
@@ -17,6 +19,7 @@ import {
 } from "./agent";
 import {
   boundedReport,
+  budgetExhaustedMessage,
   failedMessage,
   reportMessage,
   type InvestigationRecord,
@@ -117,18 +120,51 @@ export class Investigation extends DurableObject<Env> {
     return true;
   }
 
-  /** Queued -> Running. #5 defers this until the Coordinator grants a run slot. */
-  async #start(episode: Episode): Promise<void> {
-    episode.status = "Running";
-    episode.startedAt = ports().now();
-    await this.#save(episode);
-    // A durable job, not inline: it survives eviction, and keeps Datadog round trips out of the webhook.
-    await this.lifecycle.jobs.push({ id: "run", fn: "run", time: Date.now() });
+  /**
+   * Queued: asks the Coordinator for a run slot. A durable job, not inline: it survives eviction and a
+   * Coordinator hiccup, and keeps Datadog round trips out of the webhook.
+   */
+  async #start(_episode: Episode): Promise<void> {
+    await this.lifecycle.jobs.push({ id: "admit", fn: "admit", time: Date.now() });
+  }
+
+  /**
+   * The Coordinator has a run slot for this waiting Investigation, or the daily budget ran out while it waited:
+   * ask again. False when the episode is no longer waiting (it finished meanwhile), so the Coordinator moves on.
+   */
+  async slotGranted(episodeNumber: number): Promise<boolean> {
+    await this.lifecycle.start();
+    const episode = await this.#episode();
+    if (!episode || episode.number !== episodeNumber || episode.status !== "Queued") return false;
+    await this.#start(episode);
+    return true;
   }
 
   async onJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
+    if (job.fn === "admit") return this.#withBackoff(job.id, () => this.#admit());
     if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run());
     if (job.fn === "finalize") return this.#withBackoff(job.id, () => this.#finalize());
+  }
+
+  /** Queued -> Running once the Coordinator grants a run slot; Skipped when the daily budget is exhausted. */
+  async #admit(): Promise<void> {
+    const episode = await this.#episode();
+    if (!episode || episode.status !== "Queued") return;
+    const admission = await coordinatorStub(this.env).admit(this.#ref(episode));
+    if (admission === "queued") return; // the Coordinator calls slotGranted when a run slot frees
+    if (admission === "budget-exhausted") {
+      await this.#notify(episode, "budget", budgetExhaustedMessage(episode.alert));
+      return this.#finish(episode, "Skipped", { costUsd: 0, durationMs: 0 }, "daily budget exhausted");
+    }
+    episode.status = "Running";
+    episode.startedAt = ports().now();
+    await this.#save(episode);
+    await this.lifecycle.jobs.push({ id: "run", fn: "run", time: Date.now() });
+  }
+
+  /** This Alert episode's Investigation, as the Coordinator knows it. */
+  #ref(episode: Episode): InvestigationRef {
+    return { name: this.lifecycle.name, episode: episode.number };
   }
 
   /**
@@ -205,6 +241,9 @@ export class Investigation extends DurableObject<Env> {
     current.costUsd = record.costUsd;
     current.durationMs = record.durationMs;
     if (reason !== undefined) current.reason = reason;
+    // Free the run slot before recording the finished state: this path is retried only while the episode still
+    // looks unfinished. Release is idempotent and the Coordinator counts the spend once.
+    await coordinatorStub(this.env).release(this.#ref(current), record.costUsd);
     await this.#save(current);
     await this.datadog.close();
     console.log(

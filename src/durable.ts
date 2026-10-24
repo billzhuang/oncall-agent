@@ -22,6 +22,11 @@ export function investigationStub(env: Env, key: AlertEpisodeKey) {
   return euNamespace(env, env.INVESTIGATION).getByName(episodeName(key));
 }
 
+/** An Investigation by its Durable Object name (`episodeName`), e.g. as the Coordinator recorded it. */
+export function investigationStubByName(env: Env, name: string) {
+  return euNamespace(env, env.INVESTIGATION).getByName(name);
+}
+
 /** The singleton Coordinator. */
 export function coordinatorStub(env: Env) {
   return euNamespace(env, env.COORDINATOR).getByName("coordinator");
