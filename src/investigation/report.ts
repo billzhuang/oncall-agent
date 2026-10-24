@@ -199,21 +199,26 @@ export function budgetExhaustedMessage(alert: Alert): TeamsMessage {
 }
 
 /**
- * The message when a guardrail (cost cap, time limit) stopped an Investigation before it submitted its report:
- * the reason, and the evidence the agent had gathered so far (Datadog tool results, untrusted).
+ * The partial Investigation report, when a guardrail (cost cap, time limit) stopped an Investigation before the
+ * agent submitted its report: the normal report format, with what fired taken from the alert, the evidence the
+ * agent's tools gathered so far (newest first, untrusted), and the cause not determined, with the reason.
  */
-export function partialMessage(
+export function partialReportMessage(
   alert: Alert,
   reason: string,
-  evidence: readonly string[],
+  newestEvidenceFirst: readonly string[],
   record: InvestigationRecord,
+  code?: string,
 ): TeamsMessage {
+  const where = alert.group ? `, group ${alert.group}` : "";
   return {
-    title: `Investigation partial: ${alertName(alert)}`,
+    title: `Investigation report (partial): ${alertName(alert)}`,
     lines: [
-      `Partial: ${reason}. The Investigation stopped before it finished; below is what it gathered so far. Please check this alert yourself.`,
-      "Evidence gathered so far:",
-      ...(evidence.length ? evidence.map((e) => `• ${e}`) : ["• (none gathered)"]),
+      `What fired: monitor ${alert.monitorId} in Org ${alert.org}${where}: ${alertName(alert)}`,
+      "Evidence:",
+      ...(newestEvidenceFirst.length ? newestEvidenceFirst.map((e) => `• ${e}`) : ["• (none gathered)"]),
+      `Suspected cause: cause not determined (stopped: ${reason}). Please check this Alert episode yourself.`,
+      ...(code ? [code] : []),
     ],
     facts: episodeFacts(alert),
     measures: recordFacts(record),

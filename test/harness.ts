@@ -151,6 +151,9 @@ export function waitFor<T>(check: () => T | Promise<T>, opts: { timeout?: number
   return vi.waitFor(check, { timeout: 15_000, interval: 50, ...opts });
 }
 
+/** Teams text as a reader sees it: markdown escapes and dot defanging read past. */
+export const shown = (text: string): string => text.replace(/\\(.)/g, "$1").replace(/\[\.\]/g, ".");
+
 /** A promise the test resolves later, e.g. to hold a Datadog tool call open. */
 export function gate() {
   let open!: () => void;

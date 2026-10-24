@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { coordinatorStub } from "../src/durable";
 import { TEST_SECRETS, testConfig } from "./config";
 import { investigate, textOf, toolCall, type ModelRequest, type Transcript } from "./fakes/model";
-import { alertPayload, cleanUp, gate, installFakes, sendWebhook, settle, type Fakes, waitFor } from "./harness";
+import { alertPayload, cleanUp, gate, installFakes, sendWebhook, settle, shown, type Fakes, waitFor } from "./harness";
 
 let fakes: Fakes;
 afterEach(cleanUp);
@@ -132,7 +132,7 @@ describe("Concurrency", () => {
 
     await waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
     await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
-    expect(fakes.teams.posts[0].text).toMatch(/^Investigation partial/);
+    expect(shown(fakes.teams.posts[0].text)).toMatch(/^Investigation report \(partial\)/);
     expect(fakes.teams.posts[0].text).toContain(alerts[0].monitorId);
     expect(held.started).toHaveLength(2);
   });

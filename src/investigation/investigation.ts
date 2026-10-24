@@ -29,7 +29,7 @@ import {
   budgetExhaustedMessage,
   evidenceLine,
   failedMessage,
-  partialMessage,
+  partialReportMessage,
   reportMessage,
   stoppedMessage,
   type InvestigationRecord,
@@ -103,6 +103,14 @@ const abandonedKey = (e: Episode) => `abandoned:${e.number}`;
 const submittedKey = (e: Episode) => `submitted:${e.number}`;
 /** Evidence gathered by the agent's tools, one key per tool call so parallel and replayed calls never clash. */
 const evidencePrefix = (e: Episode) => `evidence:${e.number}:`;
+/** How many evidence entries the episode has: each entry's `seq`, so the partial report can list newest first. */
+const evidenceCountKey = (e: Episode) => `evidence-count:${e.number}`;
+/** One tool result kept as evidence. */
+interface Evidence {
+  seq: number;
+  at: number;
+  line: string;
+}
 /** The episode's RepoResolution; when resolved it holds `{repoUrl, sha}`, the code the workspace (#7) reads. */
 const repoKey = (e: Episode) => `repo:${e.number}`;
 /** The episode's WorkspaceState: whether its code is checked out (never the token used to clone it). */
@@ -497,12 +505,13 @@ export class Investigation extends DurableObject<Env> {
       await this.#notify(episode, "stopped", stoppedMessage(episode.alert, record));
       return this.#finish(episode, "Stopped", record, interruption.reason);
     }
-    const evidence = await this.ctx.storage.list<{ at: number; line: string }>({ prefix: evidencePrefix(episode) });
-    const lines = [...evidence.values()]
-      .sort((a, b) => a.at - b.at)
+    const evidence = await this.ctx.storage.list<Evidence>({ prefix: evidencePrefix(episode) });
+    const newestFirst = [...evidence.values()]
+      .sort((a, b) => b.seq - a.seq)
       .slice(0, MAX_EVIDENCE_LINES)
       .map((e) => e.line);
-    await this.#notify(episode, "partial", partialMessage(episode.alert, interruption.reason, lines, record));
+    const message = partialReportMessage(episode.alert, interruption.reason, newestFirst, record, await this.#codeLine(episode));
+    await this.#notify(episode, "partial", message);
     await this.#finish(episode, "Partial", record, interruption.reason);
   }
 
@@ -768,9 +777,11 @@ export class Investigation extends DurableObject<Env> {
         return episode && this.#workspaceTools(episode);
       },
       evidenceGathered: async (callId, tool, text) => {
-        const key = `${evidencePrefix(await current())}${callId}`;
+        const episode = await current();
+        const key = `${evidencePrefix(episode)}${callId}`;
         if (await storage.get(key)) return;
-        await storage.put(key, { at: ports().now(), line: evidenceLine(tool, text) });
+        const seq = ((await storage.get<number>(evidenceCountKey(episode))) ?? 0) + 1;
+        await storage.put({ [evidenceCountKey(episode)]: seq, [key]: { seq, at: ports().now(), line: evidenceLine(tool, text) } satisfies Evidence });
       },
     };
   }
