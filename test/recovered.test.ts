@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { alertPayload, cleanUp, evictedWhileTeamsDown, gate, installFakes, investigationOf, sendWebhook, settle, uniqueMonitorId, type Fakes, waitFor } from "./harness";
-import { TEST_SECRETS } from "./config";
+import { TEST_SECRETS, testConfig } from "./config";
 
 let fakes: Fakes;
 beforeEach(() => {
@@ -141,6 +141,31 @@ describe("Recovered", () => {
     datadog.release();
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
+  });
+});
+
+describe("Recovered while Queued", () => {
+  it("records no model cost for an Alert episode stopped before it ran, whatever earlier episodes spent", async () => {
+    fakes = installFakes({ config: { budgets: { ...testConfig().budgets, maxConcurrent: 1 } } });
+    const log = vi.spyOn(console, "log");
+    const monitorId = uniqueMonitorId();
+    await sendWebhook(alertPayload({ monitorId }));
+    await waitFor(() => expect(finishedRecords(log)).toMatchObject([{ monitorId, episode: 1, status: "Completed" }]));
+    expect(finishedRecords(log)[0].costUsd).toBeGreaterThan(0);
+    await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
+
+    const datadog = holdDatadog(); // another monitor's Investigation takes the only run slot
+    await sendWebhook(alertPayload());
+    await waitFor(() => expect(datadog.searches()).toBe(1));
+    await sendWebhook(alertPayload({ monitorId })); // episode 2: queued behind it
+    await sendWebhook(alertPayload({ monitorId, transition: "Recovered" }));
+
+    await waitFor(() => expect(finishedRecords(log).filter((r) => r.monitorId === monitorId)).toHaveLength(2));
+    expect(finishedRecords(log).find((r) => r.monitorId === monitorId && r.episode === 2)).toMatchObject({
+      status: "Stopped",
+      costUsd: 0,
+    });
+    datadog.release();
   });
 });
 

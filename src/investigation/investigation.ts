@@ -629,11 +629,15 @@ export class Investigation extends DurableObject<Env> {
     }
   }
 
-  /** Model spend of this Alert episode so far, and its duration since it started running. */
+  /**
+   * Model spend of this Alert episode so far, and its duration since it started running. Spend is pi's session
+   * spend minus the baseline taken just before the agent's input: no baseline means the agent never ran for this
+   * episode, so it spent nothing (whatever earlier episodes of this monitor group spent).
+   */
   async #record(episode: Episode): Promise<InvestigationRecord> {
-    const baseline = (await this.ctx.storage.get<number>(costBaselineKey(episode))) ?? 0;
+    const baseline = await this.ctx.storage.get<number>(costBaselineKey(episode));
     return {
-      costUsd: Math.max(0, (await this.#spentUsd()) - baseline),
+      costUsd: baseline === undefined ? 0 : Math.max(0, (await this.#spentUsd()) - baseline),
       durationMs: ports().now() - (episode.startedAt ?? episode.openedAt),
     };
   }
