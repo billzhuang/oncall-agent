@@ -89,6 +89,8 @@ const EPISODE = "episode";
 const DATADOG_TOOLS = "datadog-tools";
 /** A Triggered that arrived after a Recovered, while the closed episode's run was still being stopped. */
 const PENDING_TRIGGER = "pending-trigger";
+/** The serial section (see `#serially`) Triggered and Recovered notifications share. */
+const NOTIFICATIONS = "notifications";
 const MAX_JOB_FAILURES = 12;
 /** How often a finalize that found the run still going looks again. Real time: it only schedules a wake-up. */
 const RUN_POLL_MS = 30_000;
@@ -155,6 +157,11 @@ export class Investigation extends DurableObject<Env> {
    */
   async triggered(alert: Alert): Promise<TriggerOutcome> {
     await this.lifecycle.start();
+    // One notification at a time: two deliveries of the same alert, arriving together, must not both look new.
+    return this.#serially(NOTIFICATIONS, () => this.#triggered(alert));
+  }
+
+  async #triggered(alert: Alert): Promise<TriggerOutcome> {
     if (!(await this.#firstDelivery(alert))) return "duplicate";
     const now = ports().now();
     const current = await this.#episode();
@@ -180,6 +187,14 @@ export class Investigation extends DurableObject<Env> {
    */
   async recovered(alert: Alert): Promise<RecoverOutcome> {
     await this.lifecycle.start();
+    const outcome = await this.#serially(NOTIFICATIONS, () => this.#recovered(alert));
+    if (outcome !== "stopping") return outcome;
+    // Outside the serial section: the abort waits for the run to go idle, and other notifications need not wait.
+    await this.#interrupt({ status: "Stopped", reason: "the monitor recovered" });
+    return "stopped";
+  }
+
+  async #recovered(alert: Alert): Promise<Exclude<RecoverOutcome, "stopped"> | "stopping"> {
     if (!(await this.#firstDelivery(alert))) return "duplicate";
     if (await this.ctx.storage.get(PENDING_TRIGGER)) {
       // The next Alert episode recovered before it opened.
@@ -194,9 +209,7 @@ export class Investigation extends DurableObject<Env> {
       await this.#finish(episode, "Stopped", await this.#record(episode), "the monitor recovered before it started");
       return "closed";
     }
-    if (episode.status !== "Running") return "closed";
-    await this.#interrupt({ status: "Stopped", reason: "the monitor recovered" });
-    return "stopped";
+    return episode.status === "Running" ? "stopping" : "closed";
   }
 
   /**
