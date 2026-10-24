@@ -8,6 +8,7 @@ import { DatadogConnection, type DatadogToolSpec } from "../datadog-mcp";
 import { coordinatorStub } from "../durable";
 import type { Alert } from "../intake";
 import { ports } from "../ports";
+import { checkOutDeployedCommit, checkoutFailedLine, type WorkspaceState } from "../workspace/checkout";
 import { codeLine, reminderFor, resolveRepo, type RepoResolution } from "../repo-resolution";
 import { postToTeams, teamsChannelSecret, type TeamsMessage, type TeamsMessageKind } from "../teams";
 import {
@@ -15,8 +16,10 @@ import {
   alertPrompt,
   createAgentHarness,
   installDatadogTools,
+  installWorkspaceTools,
   modelAvailable,
   type AgentHost,
+  type WorkspaceTools,
 } from "./agent";
 import {
   MAX_EVIDENCE_LINES,
@@ -93,6 +96,8 @@ const submittedKey = (e: Episode) => `submitted:${e.number}`;
 const evidencePrefix = (e: Episode) => `evidence:${e.number}:`;
 /** The episode's RepoResolution; when resolved it holds `{repoUrl, sha}`, the code the workspace (#7) reads. */
 const repoKey = (e: Episode) => `repo:${e.number}`;
+/** The episode's WorkspaceState: whether its code is checked out (never the token used to clone it). */
+const workspaceKey = (e: Episode) => `workspace:${e.number}`;
 /** Whether the Coordinator granted this episode's reminder (decided once, so a retried run job keeps the answer). */
 const reminderClaimKey = (e: Episode) => `reminder-claim:${e.number}`;
 /** The agent's one submission per Alert episode; pi ignores a second submit with the same id. */
@@ -340,6 +345,8 @@ export class Investigation extends DurableObject<Env> {
     const specs = await this.datadog.listReadOnlyTools(config.datadog.tools);
     await this.ctx.storage.put(DATADOG_TOOLS, specs);
     installDatadogTools(this.#agentHost(), specs);
+    await this.#prepareWorkspace(episode, resolution);
+    installWorkspaceTools(this.#agentHost(), await this.#workspaceTools(episode));
     // A later Alert episode starts the root session on a fresh context, once (never mid-run, on a replay).
     if (episode.number > 1 && !(await this.ctx.storage.get(freshContextKey(episode)))) {
       await this.harness.session().reset();
@@ -442,8 +449,29 @@ export class Investigation extends DurableObject<Env> {
     if (granted) await this.#notify(episode, reminder.kind, reminder.message);
   }
 
+  /**
+   * Checks out the resolved repo at the deployed commit, once per Alert episode (recorded, so a re-run job
+   * neither clones again nor mints another token). No workspace without a resolved repo.
+   */
+  async #prepareWorkspace(episode: Episode, resolution: RepoResolution): Promise<void> {
+    if (resolution.outcome !== "resolved" || (await this.ctx.storage.get(workspaceKey(episode)))) return;
+    const workspace = ports().workspace(this.ctx, this.env);
+    const state = await checkOutDeployedCommit(this.env, ports().config(this.env), workspace, resolution);
+    if (state.outcome === "failed") console.warn(`Investigation ${this.lifecycle.name}: checkout failed: ${state.reason}`);
+    await this.ctx.storage.put(workspaceKey(episode), state);
+  }
+
+  /** The agent's workspace tools for this Alert episode, when its code is checked out. */
+  async #workspaceTools(episode: Episode): Promise<WorkspaceTools | undefined> {
+    const state = await this.ctx.storage.get<WorkspaceState>(workspaceKey(episode));
+    if (state?.outcome !== "ready") return undefined;
+    return { repo: state.repo, sha: state.sha, tools: ports().workspace(this.ctx, this.env).tools() };
+  }
+
   /** What the Investigation's messages say about the code, once repo resolution ran. */
   async #codeLine(episode: Episode): Promise<string | undefined> {
+    const workspace = await this.ctx.storage.get<WorkspaceState>(workspaceKey(episode));
+    if (workspace?.outcome === "failed") return checkoutFailedLine(workspace);
     const resolution = await this.ctx.storage.get<RepoResolution>(repoKey(episode));
     return resolution && codeLine(resolution);
   }
@@ -623,6 +651,10 @@ export class Investigation extends DurableObject<Env> {
         };
       },
       interrupt: (reason) => this.#interruptFromRun({ status: "Partial", reason }),
+      workspaceTools: async () => {
+        const episode = await this.#episode();
+        return episode && this.#workspaceTools(episode);
+      },
       evidenceGathered: async (callId, tool, text) => {
         const key = `${evidencePrefix(await current())}${callId}`;
         if (await storage.get(key)) return;

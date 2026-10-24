@@ -346,6 +346,8 @@ describe("Datadog MCP per Org", () => {
     await sendWebhook(alertPayload());
 
     await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
-    expect(fakes.model.requests[0].tools).toEqual(["datadog_search_datadog_logs", "submit_report"]);
+    const offered = fakes.model.requests[0].tools;
+    expect(offered.filter((t) => t.startsWith("datadog_"))).toEqual(["datadog_search_datadog_logs"]);
+    expect(offered).toContain("submit_report");
   });
 });

@@ -11,7 +11,7 @@ import type { TeamsMessage } from "./teams";
  */
 export type RepoResolution =
   /** The repo and the deployed commit, in a repo the GitHub App is installed on. */
-  | { outcome: "resolved"; service: string; repo: string; repoUrl: string; sha: string }
+  | { outcome: "resolved"; service: string; repo: string; repoUrl: string; sha: string; installationId?: number }
   /**
    * Unmapped service: no git tags (or no service tag to look them up by). `reason` is set when tags exist but
    * cannot be trusted to name one repo and commit (the service's spans disagree).
@@ -63,14 +63,17 @@ export async function resolveRepo(
   const [tags] = found as [GitTags];
   const repo = githubRepoFromUrl(tags.repositoryUrl);
   if (!repo) return { outcome: "not-enabled", service, repo: repoDisplay(tags.repositoryUrl), onGitHub: false, sha: tags.sha };
+  let installationId: number | undefined;
   try {
-    if ((await appInstallationFor(env, config, repo)) === undefined) {
-      return { outcome: "not-enabled", service, repo: repoName(repo), onGitHub: true, sha: tags.sha };
-    }
+    installationId = await appInstallationFor(env, config, repo);
   } catch (error) {
     return { outcome: "unresolved", service, reason: `checking the GitHub App installation failed: ${message(error)}` };
   }
-  return { outcome: "resolved", service, repo: repoName(repo), repoUrl: `https://github.com/${repoName(repo)}`, sha: tags.sha };
+  if (installationId === undefined) {
+    return { outcome: "not-enabled", service, repo: repoName(repo), onGitHub: true, sha: tags.sha };
+  }
+  const repoUrl = `https://github.com/${repoName(repo)}`;
+  return { outcome: "resolved", service, repo: repoName(repo), repoUrl, sha: tags.sha, installationId };
 }
 
 interface GitTags {

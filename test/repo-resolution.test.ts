@@ -40,8 +40,16 @@ describe("Repo resolution", () => {
     expect(report.text).toContain(sha);
     // Read through the Org's own Datadog MCP connection.
     expect(fakes.datadog.spanSearches.map((s) => s.token)).toEqual([TEST_SECRETS.GAP_DATADOG_TOKEN]);
-    // Checked against the GitHub App installation with a valid App JWT; nothing written to GitHub.
-    expect(fakes.github.calls).toEqual([{ method: "GET", path: `/repos/acme/${service}/installation`, body: undefined }]);
+    // Checked against the GitHub App installation with a valid App JWT, then a read-only token for that repo only
+    // to check out its code (test/workspace.test.ts); nothing written to GitHub.
+    expect(fakes.github.calls).toEqual([
+      { method: "GET", path: `/repos/acme/${service}/installation`, body: undefined },
+      {
+        method: "POST",
+        path: "/app/installations/1/access_tokens",
+        body: { repositories: [service], permissions: { contents: "read" } },
+      },
+    ]);
     expect(fakes.github.jwtErrors).toEqual([]);
     await settle();
     expect(fakes.teams.posts).toHaveLength(1); // no reminder

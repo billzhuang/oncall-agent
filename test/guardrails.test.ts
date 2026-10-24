@@ -19,6 +19,12 @@ function finishedRecords(log: { mock: { calls: unknown[][] } }): Array<Record<st
     .filter((r) => r?.event === "investigation.finished");
 }
 
+/**
+ * No code workspace for the alert's service (its checkout fails): the workspace tools and prompt section would
+ * make the first request alone cost over $3 at EXPENSIVE, before any evidence is gathered.
+ */
+const withoutCode = (f: Fakes) => f.workspace.unavailable("acme/checkout");
+
 /** $ per million tokens at which each model request costs about a dollar or more. */
 const EXPENSIVE = 5_000;
 
@@ -26,6 +32,7 @@ describe("Cost cap", () => {
   it("ends an Investigation that spends more than $3 as Partial, with the evidence so far and the reason", async () => {
     const log = vi.spyOn(console, "log");
     fakes = installFakes({ costPerMTok: EXPENSIVE });
+    withoutCode(fakes);
     fakes.model.script(keepsSearching);
 
     await sendWebhook(alertPayload());
@@ -115,6 +122,7 @@ describe("30-minute limit", () => {
 describe("Once across replays", () => {
   it("posts the partial message once when Teams fails at first and the Investigation is evicted", async () => {
     fakes = installFakes({ costPerMTok: EXPENSIVE });
+    withoutCode(fakes);
     fakes.model.script(keepsSearching);
     fakes.teams.fail(1);
     const alert = alertPayload();

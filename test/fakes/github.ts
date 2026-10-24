@@ -11,6 +11,15 @@ export interface GitHubCall {
   body: unknown;
 }
 
+/** An installation access token the fake issued, with what it was scoped to. */
+export interface IssuedToken {
+  token: string;
+  installationId: number;
+  /** Repo names the token was limited to, or undefined when the request did not limit it. */
+  repositories: string[] | undefined;
+  permissions: Record<string, string>;
+}
+
 /** The owner whose repos the test GitHub App is installed on by default (all repos). */
 export const DEFAULT_INSTALLED_OWNER = "acme";
 
@@ -31,6 +40,7 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
   /** Problems with App JWTs presented to the fake; a test asserts this stays empty. */
   const jwtErrors: string[] = [];
   const installations: Installation[] = [{ id: 1, owner: DEFAULT_INSTALLED_OWNER, repos: "all" }];
+  const tokens: IssuedToken[] = [];
   const service: FakeService = {
     async handle(request) {
       const url = new URL(request.url);
@@ -52,6 +62,30 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
         if (!found) return Response.json({ message: "Not Found" }, { status: 404 });
         return Response.json({ id: found.id, account: { login: found.owner }, repository_selection: found.repos === "all" ? "all" : "selected" });
       }
+
+      const accessTokens = url.pathname.match(/^\/app\/installations\/(\d+)\/access_tokens$/);
+      if (request.method === "POST" && accessTokens) {
+        const problem = await verifyAppJwt(request.headers.get("authorization"), opts.appId);
+        if (problem) {
+          jwtErrors.push(problem);
+          return Response.json({ message: problem }, { status: 401 });
+        }
+        const installation = installations.find((i) => i.id === Number(accessTokens[1]));
+        if (!installation) return Response.json({ message: "Not Found" }, { status: 404 });
+        const body = (text ? JSON.parse(text) : {}) as { repositories?: string[]; permissions?: Record<string, string> };
+        const covered = (repo: string) =>
+          installation.repos === "all" || installation.repos.some((r) => r.toLowerCase() === repo.toLowerCase());
+        if (body.repositories?.some((r) => !covered(r))) {
+          return Response.json({ message: "There is at least one repository that does not exist or is not accessible" }, { status: 422 });
+        }
+        const token = `ghs_test${tokens.length + 1}x${crypto.randomUUID().replace(/-/g, "")}`;
+        const permissions = body.permissions ?? { contents: "write", pull_requests: "write", metadata: "read" };
+        tokens.push({ token, installationId: installation.id, repositories: body.repositories, permissions });
+        return Response.json(
+          { token, expires_at: new Date(ports().now() + 3_600_000).toISOString(), permissions, repository_selection: "selected" },
+          { status: 201 },
+        );
+      }
       return Response.json({ message: "Not Found" }, { status: 404 });
     },
   };
@@ -59,6 +93,8 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
     ...service,
     calls,
     jwtErrors,
+    /** Installation access tokens issued, in order. */
+    tokens,
     /** Installs the App on some repos of an owner ("all" for every repo). */
     install(owner: string, repos: string[] | "all") {
       installations.push({ id: installations.length + 1, owner, repos });

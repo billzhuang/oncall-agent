@@ -1,6 +1,8 @@
 import type { Provider } from "@earendil-works/pi-ai";
 import { createAI } from "agents/models/pi-ai";
 import { parseConfig, type OncallConfig } from "./config";
+import type { CodeWorkspace } from "./workspace/code-workspace";
+import { ComputerWorkspace } from "./workspace/computer";
 
 /**
  * The one seam: everything outside the Worker that tests replace. Production defaults below.
@@ -18,9 +20,13 @@ export interface Ports {
   modelProvider(env: Env): Provider;
   /** Parsed ONCALL_CONFIG. */
   config(env: Env): OncallConfig;
+  /** The Investigation's code workspace (native Computer in its own storage; in-memory in tests). */
+  workspace(ctx: DurableObjectState, env: Env): CodeWorkspace;
 }
 
 const providers = new WeakMap<object, Provider>();
+/** One Workspace per Durable Object, so every caller sees the same filesystem state. */
+const workspaces = new WeakMap<DurableObjectState, CodeWorkspace>();
 
 const production: Ports = {
   now: () => Date.now(),
@@ -34,6 +40,14 @@ const production: Ports = {
     return provider;
   },
   config: (env) => parseConfig(env.ONCALL_CONFIG),
+  workspace: (ctx) => {
+    let workspace = workspaces.get(ctx);
+    if (!workspace) {
+      workspace = new ComputerWorkspace(ctx);
+      workspaces.set(ctx, workspace);
+    }
+    return workspace;
+  },
 };
 
 let current: Ports = production;

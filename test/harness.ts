@@ -14,6 +14,7 @@ import { fakeGitHub } from "./fakes/github";
 import { scriptedModel } from "./fakes/model";
 import { router } from "./fakes/router";
 import { fakeTeams } from "./fakes/teams";
+import { fakeWorkspaces } from "./fakes/workspace";
 import { GAP_ORG_ID, GITHUB_APP_ID, MODEL_ID, TEST_SECRETS, WK_ORG_ID, testConfig } from "./config";
 
 /**
@@ -26,6 +27,7 @@ export function installFakes(opts: { config?: Record<string, unknown>; now?: num
   const github = fakeGitHub({ appId: GITHUB_APP_ID });
   const datadog = fakeDatadogMcp();
   const model = scriptedModel(String(opts.config?.modelId ?? MODEL_ID), opts.costPerMTok);
+  const workspace = fakeWorkspaces();
   datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, defaultDatadogTools("gap"));
   datadog.org(TEST_SECRETS.WK_DATADOG_TOKEN, defaultDatadogTools("wk"));
   const network = router({ "teams.test": teams, "api.github.com": github, "mcp.datadoghq.eu": datadog });
@@ -33,9 +35,10 @@ export function installFakes(opts: { config?: Record<string, unknown>; now?: num
     now: clock.now,
     fetch: network.fetch,
     modelProvider: () => model.provider,
+    workspace: (ctx) => workspace.of(ctx.id.toString()),
     config: () => parseConfig(testConfig(opts.config)), // still goes through the real parser
   });
-  return { clock, teams, github, datadog, model, network };
+  return { clock, teams, github, datadog, model, workspace, network };
 }
 export type Fakes = ReturnType<typeof installFakes>;
 

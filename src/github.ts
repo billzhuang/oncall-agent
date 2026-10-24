@@ -42,19 +42,54 @@ export async function appInstallationFor(env: Env, config: OncallConfig, repo: R
   return ((await res.json()) as { id: number }).id;
 }
 
+/** What an installation access token may do: GitHub App permission name -> level. */
+export type TokenPermissions = Partial<Record<"contents" | "pull_requests" | "metadata", "read" | "write">>;
+
+/**
+ * An installation access token limited to the one repo and to `permissions` (1 hour). For the harness only: it is
+ * never put in a tool result, a prompt or a message, and is never stored.
+ */
+export async function installationToken(
+  env: Env,
+  config: OncallConfig,
+  installationId: number,
+  repo: RepoRef,
+  permissions: TokenPermissions,
+): Promise<string> {
+  const res = await ports().fetch(`${API}/app/installations/${installationId}/access_tokens`, {
+    method: "POST",
+    headers: { ...HEADERS, authorization: `Bearer ${await appJwt(env, config)}`, "content-type": "application/json" },
+    body: JSON.stringify({ repositories: [repo.name], permissions }),
+  });
+  if (!res.ok) throw new Error(`GitHub answered ${res.status} for an installation token for ${repoName(repo)}`);
+  const { token } = (await res.json()) as { token?: unknown };
+  if (typeof token !== "string" || !token) throw new Error(`GitHub returned no installation token for ${repoName(repo)}`);
+  return token;
+}
+
 const HEADERS = {
   accept: "application/vnd.github+json",
   "x-github-api-version": "2022-11-28",
   "user-agent": "oncall-agent",
 };
 
+/** The App JWT last signed, reused for a few minutes: RSA signing is the slow part of every GitHub call. */
+let lastJwt: { pem: string; appId: string; iat: number; jwt: string } | undefined;
+/** How long a signed App JWT is reused (it is valid 9 minutes past `iat + 60`). */
+const JWT_REUSE_SECONDS = 5 * 60;
+
 /** A GitHub App JWT (RS256; issued a minute back for clock skew, valid 9 minutes). */
 async function appJwt(env: Env, config: OncallConfig): Promise<string> {
   const pem = secret(env, config.github.privateKeySecret);
   if (!pem) throw new Error(`Worker secret ${config.github.privateKeySecret} (GitHub App private key) is not set`);
   const now = Math.floor(ports().now() / 1000);
+  const appId = config.github.appId;
+  const cached = lastJwt;
+  if (cached && cached.pem === pem && cached.appId === appId && now >= cached.iat + 60 && now < cached.iat + 60 + JWT_REUSE_SECONDS) {
+    return cached.jwt;
+  }
   const encode = (value: unknown) => base64url(new TextEncoder().encode(JSON.stringify(value)));
-  const unsigned = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iat: now - 60, exp: now + 540, iss: config.github.appId })}`;
+  const unsigned = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iat: now - 60, exp: now + 540, iss: appId })}`;
   const key = await crypto.subtle.importKey(
     "pkcs8",
     pemBytes(pem),
@@ -63,7 +98,9 @@ async function appJwt(env: Env, config: OncallConfig): Promise<string> {
     ["sign"],
   );
   const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(unsigned));
-  return `${unsigned}.${base64url(new Uint8Array(signature))}`;
+  const jwt = `${unsigned}.${base64url(new Uint8Array(signature))}`;
+  lastJwt = { pem, appId, iat: now - 60, jwt };
+  return jwt;
 }
 
 function pemBytes(pem: string): Uint8Array {
