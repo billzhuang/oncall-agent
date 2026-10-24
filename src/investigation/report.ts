@@ -85,11 +85,13 @@ function agentPrLine(pr: AgentPrRecord): string {
       return "Agent PR: none, Report-only mode is on; the agent's proposed fix was not opened as a PR.";
     case "no-changes":
       return "Agent PR: none, the agent declared a fix but changed no file.";
-    case "protected-paths":
-      return (
-        "Agent PR: none, the proposed fix touches protected paths (CI, build, dependency or ownership files), " +
-        `which the oncall agent never pushes: ${pr.paths.slice(0, 10).join(", ")}${pr.paths.length > 10 ? ", …" : ""}.`
-      );
+    case "protected-paths": {
+      const which = pr.allowedPrefixes
+        ? `protected paths (CI, build, dependency or ownership files) or paths outside the repo's allowed prefixes (${pr.allowedPrefixes.join(", ")})`
+        : "protected paths (CI, build, dependency or ownership files)";
+      const list = `${pr.paths.slice(0, 10).join(", ")}${pr.paths.length > 10 ? ", …" : ""}`;
+      return `Agent PR: none, the proposed fix touches ${which}, which the oncall agent never pushes: ${list}.`;
+    }
     case "failed":
       return `Agent PR: could not be opened (${pr.reason}).`;
   }

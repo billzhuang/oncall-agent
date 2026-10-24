@@ -61,7 +61,12 @@ export const DEFAULT_DATADOG_TOOLS = [
  * Paths an Agent PR may never change (globs, case-insensitive; `**\/` = at any depth, `*` = within one path
  * segment). Pushing a branch to the repo runs its CI with the repo's secrets, so a prompt-injected agent must not
  * reach CI config, build entry points, scripts, dependency manifests or lockfiles, or ownership rules. A fix that
- * touches any of them opens no Agent PR; the report lists them.
+ * touches any of them opens no Agent PR; the report lists them. `{a,b}` alternatives are allowed.
+ *
+ * This deny-list narrows the CI-secrets risk of pushing model-written code to a same-repo branch, but cannot close
+ * it: any source file may be imported by a test or build that CI runs with secrets. The structural decision
+ * (fork-based Agent PRs, whose CI gets no secrets) is pending and must be made before Agent PRs are enabled
+ * (Report-only mode off) for any team.
  */
 export const DEFAULT_PROTECTED_PATHS = [
   "**/.github/**",
@@ -93,7 +98,42 @@ export const DEFAULT_PROTECTED_PATHS = [
   "**/pyproject.toml",
   "**/build.gradle*",
   "**/pom.xml",
+  "**/.pnpmfile.cjs",
+  "**/.yarnrc*",
+  "**/.yarn/**",
+  "**/gradlew*",
+  "**/gradle/**",
+  "**/settings.gradle*",
+  "**/mvnw*",
+  "**/.mvn/**",
+  "**/go.mod",
+  "**/requirements*.txt",
+  "**/setup.cfg",
+  "**/Cargo.toml",
+  "**/build.rs",
+  "**/Gemfile",
+  "**/*.gemspec",
+  "**/Rakefile",
+  "**/.circleci/**",
+  "**/.travis.yml",
+  "**/azure-pipelines*.yml",
+  "**/bitbucket-pipelines.yml",
+  "**/.buildkite/**",
+  "**/justfile",
+  "**/Taskfile*",
+  "**/conftest.py",
+  "**/*.config.{js,cjs,mjs,ts}",
+  "**/.env*",
 ];
+
+/** Per-repo Agent PR settings, keyed by `owner/name` (case-insensitive). */
+const RepoSettingsSchema = z.object({
+  /**
+   * When set, an Agent PR may change only paths under these prefixes (e.g. `src/`); a fix touching anything else
+   * opens no PR. Unset: any path not protected.
+   */
+  allowedPathPrefixes: z.array(z.string().min(1)).optional(),
+});
 
 const ConfigSchema = z
   .object({
@@ -108,6 +148,8 @@ const ConfigSchema = z
       privateKeySecret: SecretName,
       /** Paths an Agent PR may never change (see DEFAULT_PROTECTED_PATHS). */
       protectedPaths: z.array(z.string().min(1)).default(DEFAULT_PROTECTED_PATHS),
+      /** Per-repo Agent PR settings, keyed by `owner/name`. */
+      repos: z.record(z.string().regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/), RepoSettingsSchema).default({}),
     }),
     /** Report-only mode: `global`, overridden per Owning team where `teams` names it. */
     reportOnly: z

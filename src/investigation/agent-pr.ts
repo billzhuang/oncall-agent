@@ -21,8 +21,11 @@ export type AgentPrRecord =
   | { outcome: "report-only" }
   /** The agent declared a fix but changed no file. */
   | { outcome: "no-changes" }
-  /** The fix changes protected paths (CI, build, dependency or ownership files): nothing is pushed. */
-  | { outcome: "protected-paths"; paths: string[] }
+  /**
+   * The fix changes protected paths (CI, build, dependency or ownership files), or paths outside the repo's
+   * `allowedPrefixes` when it has them: nothing is pushed.
+   */
+  | { outcome: "protected-paths"; paths: string[]; allowedPrefixes?: string[] }
   /** GitHub refused or kept failing; the report says so. */
   | { outcome: "failed"; reason: string };
 
@@ -33,21 +36,35 @@ export function reportOnly(config: OncallConfig, tags: readonly string[]): boole
 }
 
 /**
- * The changed paths an Agent PR may not push (`config.github.protectedPaths`), matched case-insensitively against
- * the path and every path below a leading `./`. A deleted file counts like a changed one.
+ * The changed paths an Agent PR may not push to `repo` (`owner/name`): those matching `config.github.protectedPaths`
+ * (case-insensitive), and, when the repo has `allowedPathPrefixes`, those outside every prefix. A deleted file
+ * counts like a changed one. (This narrows, but cannot close, the risk of CI running model-written code with the
+ * repo's secrets; see DEFAULT_PROTECTED_PATHS.)
  */
-export function protectedPaths(config: OncallConfig, changes: readonly FileChange[]): string[] {
+export function blockedPaths(
+  config: OncallConfig,
+  repo: string,
+  changes: readonly FileChange[],
+): { paths: string[]; allowedPrefixes?: string[] } {
   const patterns = config.github.protectedPaths.map(globRegExp);
-  return changes.map((c) => c.path).filter((path) => {
+  const settings = Object.entries(config.github.repos).find(([name]) => name.toLowerCase() === repo.toLowerCase())?.[1];
+  const prefixes = settings?.allowedPathPrefixes;
+  const paths = changes.map((c) => c.path).filter((path) => {
     const normal = path.replace(/^(?:\.\/)+/, "").replace(/\/{2,}/g, "/");
+    if (prefixes && !prefixes.some((prefix) => normal.startsWith(prefix.replace(/^(?:\.\/)+/, "")))) return true;
     return patterns.some((re) => re.test(normal));
   });
+  return prefixes ? { paths, allowedPrefixes: prefixes } : { paths };
 }
 
-/** A glob as a case-insensitive RegExp: `**\/` any leading directories, `**` anything, `*` and `?` within a segment. */
+/**
+ * A glob as a case-insensitive RegExp: `**\/` any leading directories, `**` anything, `*` and `?` within a segment,
+ * `{a,b}` either alternative.
+ */
 function globRegExp(glob: string): RegExp {
   const source = glob
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/[.+^$()|[\]\\]/g, "\\$&")
+    .replace(/\{([^{}]*)\}/g, (_, alternatives: string) => `(?:${alternatives.split(",").join("|")})`)
     .replace(/\*\*\//g, "\u0001")
     .replace(/\*\*/g, "\u0000")
     .replace(/\*/g, "[^/]*")

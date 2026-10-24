@@ -23,7 +23,10 @@ Terms in **bold** are defined in [GLOSSARY.md](../GLOSSARY.md). Key decisions: [
 - Daily budget $30; once reached, new Alert episodes get only a "budget exhausted, not investigated" notice until 00:00 UTC.
 - Every outward action (branch push, PR, Teams message) is idempotent: it checks for an existing result first, because pi-durable may replay steps after resuming.
 - No Datadog writes (MCP write access is disabled anyway).
-- The agent has no GitHub credentials (ADR 0002).
+- The agent has no GitHub credentials (ADR 0002). For an Agent PR the harness mints a token for the one repo with `contents:write` and `pull_requests:write` only, and writes only `oncall-agent/*` branches (one per monitor group, so a later Alert episode updates the open Agent PR).
+- An Agent PR never changes protected paths: CI config, build entry points, scripts, dependency manifests and lockfiles, CODEOWNERS (default list in `src/config.ts`, `github.protectedPaths`). A pushed branch runs the repo's CI with its secrets, so a fix touching any of them gets no PR; the report lists the paths. A repo may also set `github.repos["owner/name"].allowedPathPrefixes`, outside which nothing is pushed. This narrows but cannot close the CI-secrets risk; whether Agent PRs come from a fork (whose CI gets no secrets) is pending and must be decided before Report-only mode is turned off for any team.
+- The PR description renders everything the model wrote as code, so it cannot add links, @mentions, #references or HTML.
+- **Report-only mode**: the Owning team's switch where config names the team, else the global one (so a pilot team can get Agent PRs while the global switch stays on).
 - This repo is public: all secrets (Datadog tokens, GitHub App private key, Teams webhook URLs, per-Org webhook secrets) live in Worker secrets; the Org registry references them by name only.
 - A daily scheduled check posts to the default Teams channel 14 days before any Datadog token expires. Rotation is a manual runbook until Datadog supports generic OIDC.
 

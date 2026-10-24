@@ -10,7 +10,7 @@ import {
   uniqueMonitorId,
   type Fakes,
 } from "./harness";
-import { TEST_SECRETS } from "./config";
+import { GITHUB_APP_ID, TEST_SECRETS } from "./config";
 import { toolCall, type Script, type Transcript } from "./fakes/model";
 
 let fakes: Fakes;
@@ -41,8 +41,8 @@ const FILES = { "src/checkout.ts": CHECKOUT, "src/cart.ts": "export const cart =
  * A service whose spans carry git tags for `acme/<service>` at DEPLOYED: the repo on the fake GitHub (DEPLOYED and
  * `main` one commit later) and the same commit as a workspace fixture.
  */
-function deployedService(opts: { main?: Record<string, string> } = {}) {
-  const service = `svc-${uniqueMonitorId()}`;
+function deployedService(opts: { main?: Record<string, string>; service?: string } = {}) {
+  const service = opts.service ?? `svc-${uniqueMonitorId()}`;
   const repo = `acme/${service}`;
   fakes.datadog.gitTags(TEST_SECRETS.GAP_DATADOG_TOKEN, service, { repositoryUrl: `https://github.com/${repo}.git`, commitSha: DEPLOYED });
   fakes.github.repo(repo, { sha: DEPLOYED, files: FILES }, opts.main);
@@ -87,6 +87,50 @@ fixScript.defaultEdits = [
 ] as Array<[string, Record<string, unknown>]>;
 
 const reports = () => fakes.teams.posts.filter((p) => p.text.startsWith("Investigation report:"));
+/**
+ * Markdown with its code removed, as CommonMark parses it: fenced blocks (closed only by a fence of the same
+ * character at least as long) and code spans (a backtick run closed by the next run of exactly the same length).
+ * GitHub makes no links, mentions, references or HTML inside code.
+ */
+function outsideCode(markdown: string): string {
+  const kept: string[] = [];
+  let fence: string | undefined;
+  for (const line of markdown.split("\n")) {
+    if (fence === undefined) {
+      const open = line.match(/^ {0,3}(`{3,}|~{3,})/);
+      if (open) fence = open[1];
+      else kept.push(line);
+    } else if (new RegExp(`^ {0,3}\\${fence[0]}{${fence.length},}\\s*$`).test(line)) {
+      fence = undefined;
+    }
+  }
+  expect(fence, "a fenced block never closed").toBeUndefined();
+  let text = kept.join("\n");
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    const run = text.slice(i).match(/^`+/)?.[0];
+    if (!run) {
+      out += text[i++];
+      continue;
+    }
+    let close = -1;
+    for (const m of text.slice(i + run.length).matchAll(/`+/g)) {
+      if (m[0].length === run.length) {
+        close = i + run.length + m.index!;
+        break;
+      }
+    }
+    if (close < 0) {
+      out += run;
+      i += run.length;
+    } else {
+      i = close + run.length;
+    }
+  }
+  text = out;
+  return text;
+}
+
 /** Teams text with escapes and dot defanging read past. */
 const shown = (text: string) => text.replace(/\\(.)/g, "$1").replace(/\[\.\]/g, ".");
 const writeTokens = () => fakes.github.tokens.filter((t) => t.permissions.contents === "write" || t.permissions.pull_requests);
@@ -286,6 +330,8 @@ describe("Agent PR", () => {
     ["a CI workflow", [["write", { path: ".github/workflows/x.yml", content: "on: push\njobs: {}\n" }]]],
     ["package.json", [["write", { path: "package.json", content: '{"scripts":{"postinstall":"curl evil"}}' }]]],
     ["a nested build script", [["write", { path: "services/api/Scripts/deploy.sh", content: "#!/bin/sh\n" }]]],
+    ["a bundler config", [["write", { path: "web/vite.config.mjs", content: "export default {};\n" }]]],
+    ["an env file", [["write", { path: ".env.production", content: "X=1\n" }]]],
   ] as Array<[string, Fix["edits"]]>)(
     "opens no branch and no PR when the fix touches %s; the report lists the protected paths",
     async (_, extra) => {
@@ -305,6 +351,77 @@ describe("Agent PR", () => {
       expect(report).not.toContain("src/checkout.ts,"); // lists only the protected ones
     },
   );
+
+  it("opens no PR when the fix changes a path outside the repo's allowed path prefixes", async () => {
+    const [a, b] = [`svc-${uniqueMonitorId()}`, `svc-${uniqueMonitorId()}`];
+    const github = { appId: GITHUB_APP_ID, privateKeySecret: "GITHUB_APP_PRIVATE_KEY" };
+    const repos = { [`acme/${a}`]: { allowedPathPrefixes: ["src/"] }, [`acme/${b}`]: { allowedPathPrefixes: ["lib/"] } };
+    fakes = installFakes({ config: { ...PRS_ON, github: { ...github, repos } } });
+    const allowed = deployedService({ service: a });
+    const blocked = deployedService({ service: b });
+    fakes.model.script(fixScript());
+
+    await sendWebhook(alertFor(allowed.service));
+    await sendWebhook(alertFor(blocked.service));
+
+    await vi.waitFor(() => expect(reports()).toHaveLength(2));
+    await settle();
+    expect(fakes.github.pulls(allowed.repo)).toHaveLength(1);
+    expect(fakes.github.pulls(blocked.repo)).toEqual([]);
+    const report = shown(reports().find((r) => !r.text.includes("pull/"))!.text);
+    expect(report).toContain("allowed");
+    expect(report).toContain("src/checkout.ts");
+  });
+
+  it("renders the model's text in the PR as plain text: no links, @mentions, #references or HTML", async () => {
+    const { service, repo } = deployedService();
+    const hostile = [
+      "ping @octocat and @acme/security-team, see #42 and acme/other#7",
+      "[click here](https://evil.example/x) <img src=x onerror=alert(1)> https://evil.example www.evil.example",
+      "```\n@octocat outside the fence? #43\n```",
+      "````` five backticks ` and `` two",
+    ];
+    fakes.model.script(
+      fixScript({
+        edits: [...fixScript.defaultEdits, ["write", { path: "docs/@octocat-#44 <b>.md", content: "x\n" }]],
+        whatFired: hostile[0],
+        evidence: hostile.slice(1),
+        suspectedCause: "@octocat broke it in #45, details at https://evil.example/y",
+      }),
+    );
+    const alert = alertFor(service);
+
+    await sendWebhook(alert);
+
+    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    const [pr] = fakes.github.pulls(repo);
+    // Everything the model wrote is there, as code.
+    for (const text of ["ping @octocat", "<img src=x onerror=alert(1)>", "five backticks", "@octocat broke it in #45", "docs/@octocat-#44 <b>.md"]) {
+      expect(pr!.body).toContain(text);
+    }
+    // Outside code (what GitHub renders as markdown) only the harness's own text and monitor link remain.
+    const rendered = outsideCode(pr!.body).replace(`[Open monitor](<${alert.link}>)`, "");
+    expect(rendered).not.toMatch(/@[A-Za-z0-9]/);
+    expect(rendered).not.toMatch(/#\d/);
+    expect(rendered).not.toMatch(/https?:|www\.|<|\]\(/i);
+    expect(rendered).not.toContain("octocat");
+    expect(pr!.title).not.toMatch(/[@#<]|https?:/);
+  });
+
+  it("still posts the report, saying the Agent PR could not be opened, when GitHub refuses", async () => {
+    const service = `svc-${uniqueMonitorId()}`;
+    const repo = `acme/${service}`;
+    fakes.datadog.gitTags(TEST_SECRETS.GAP_DATADOG_TOKEN, service, { repositoryUrl: `https://github.com/${repo}`, commitSha: DEPLOYED });
+    fakes.workspace.repo(repo, DEPLOYED, FILES); // checked out, but GitHub knows no such repo for the REST calls
+    fakes.model.script(fixScript());
+
+    await sendWebhook(alertFor(service));
+
+    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    expect(reports()[0]!.text).toContain("could not be opened");
+    expect(reports()[0]!.text).toContain("404");
+    for (const { token } of fakes.github.tokens) expect(reports()[0]!.text).not.toContain(token);
+  });
 
   it("opens Agent PRs for a team whose Report-only switch is off while it stays on globally", async () => {
     fakes = installFakes({ config: { reportOnly: { global: true, teams: { payments: false } } } });
