@@ -22,6 +22,12 @@ const OrgSchema = z.object({
   webhookSecret: SecretName,
   /** Worker secret holding the Org's default Teams Workflows webhook URL. */
   defaultTeamsSecret: SecretName,
+  /**
+   * GitHub owners (users or organizations, case-insensitive) whose repos this Org's services may resolve to. A repo
+   * of any other owner is treated as repo not enabled (report and reminder; no clone, no token, no Agent PR), even
+   * when the GitHub App is installed on it. Unset: any owner the App is installed on.
+   */
+  allowedRepoOwners: z.array(z.string().regex(/^[A-Za-z0-9-]+$/)).optional(),
 });
 
 /**

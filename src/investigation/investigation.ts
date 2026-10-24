@@ -539,7 +539,7 @@ export class Investigation extends DurableObject<Env> {
    * Coordinator's reminder ledger) and once per Alert episode (the outbox).
    */
   async #remind(episode: Episode, resolution: RepoResolution): Promise<void> {
-    const reminder = reminderFor(episode.alert.org, resolution);
+    const reminder = reminderFor(episode.alert, resolution);
     if (!reminder) return;
     let granted = await this.ctx.storage.get<boolean>(reminderClaimKey(episode));
     if (granted === undefined) {
@@ -573,7 +573,7 @@ export class Investigation extends DurableObject<Env> {
     const workspace = await this.ctx.storage.get<WorkspaceState>(workspaceKey(episode));
     if (workspace?.outcome === "failed") return checkoutFailedLine(workspace);
     const resolution = await this.ctx.storage.get<RepoResolution>(repoKey(episode));
-    return resolution && codeLine(resolution);
+    return resolution && codeLine(episode.alert.org, resolution);
   }
 
   /** Why the agent's run ended without a report, in words for the failed message. */

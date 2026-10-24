@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { alertPayload, cleanUp, installFakes, sendWebhook, settle, uniqueMonitorId, type Fakes, waitFor } from "./harness";
-import { TEST_SECRETS } from "./config";
+import { TEST_SECRETS, testConfig } from "./config";
 import { defaultDatadogTools } from "./fakes/datadog-mcp";
 
 let fakes: Fakes;
@@ -150,6 +150,49 @@ describe("Unmapped service", () => {
     expect(fakes.github.calls).toEqual([]); // no installation lookup, no workspace, no Agent PR
   });
 
+  it("reminds the Owning team when the service's spans disagree on the repo or deployed commit", async () => {
+    const service = uniqueService();
+    const span = (repo: string, sha: string) => ({
+      service,
+      tags: [`service:${service}`, `git.repository_url:github.com/acme/${repo}`, `git.commit.sha:${sha}`],
+    });
+    fakes.datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, [
+      ...defaultDatadogTools("gap"),
+      { name: "search_datadog_spans", result: () => ({ data: [span(service, "abcdef1"), span("other", "1234567")] }) },
+    ]);
+
+    await sendWebhook(alertFor(service));
+
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    const [reminder] = fakes.teams.posts.filter((p) => !p.text.startsWith("Investigation report:"));
+    expect(reminder.channel).toBe("sre");
+    expect(reminder.text).toContain(`Unmapped service: ${service}`);
+    expect(reminder.text).toContain("disagree");
+  });
+
+  it("reminds about a monitor that names no service at most once per Org and monitor every 7 days", async () => {
+    const monitorId = uniqueMonitorId();
+    const days = (n: number) => n * 24 * 60 * 60 * 1000;
+    const noService = (alertId?: string) =>
+      alertPayload({ monitorId, alertId, group: "env:prod", tags: ["oncall-agent:enabled", "team:sre"] });
+    const reminders = () => fakes.teams.posts.filter((p) => p.text.includes(`monitor ${monitorId} names no service`));
+    const first = noService();
+
+    await sendWebhook(first);
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    expect(reports()[0].text).toContain("the monitor names no service");
+    expect(reminders()).toHaveLength(1);
+    expect(reminders()[0].channel).toBe("sre");
+
+    // The next Alert episode of the same monitor, within 7 days: a report, no second reminder.
+    await sendWebhook({ ...first, alertId: `${first.alertId}-r`, transition: "Recovered" });
+    fakes.clock.advance(days(6));
+    await sendWebhook(noService());
+    await waitFor(() => expect(reports()).toHaveLength(2));
+    await settle();
+    expect(reminders()).toHaveLength(1);
+  });
+
   it("reminds at most once per Org and service every 7 days", async () => {
     const service = uniqueService();
     const days = (n: number) => n * 24 * 60 * 60 * 1000;
@@ -237,6 +280,31 @@ describe("Repo not enabled", () => {
     fakes.clock.advance(days(7));
     await sendWebhook(alertFor(second));
     await waitFor(() => expect(reminders()).toHaveLength(2));
+  });
+
+  it("treats a repo whose owner the Org does not allow as not enabled, before any GitHub call, even when the App is installed", async () => {
+    const orgs = testConfig().orgs.map((o) => (o.name === "gap" ? { ...o, allowedRepoOwners: ["ACME"] } : o));
+    fakes = installFakes({ config: { orgs } });
+    const [foreign, own] = [uniqueService(), uniqueService()];
+    const owner = `stranger-${uniqueMonitorId()}`;
+    fakes.github.install(owner, "all"); // installed: only the Org's owner list refuses it
+    fakes.datadog.gitTags(TEST_SECRETS.GAP_DATADOG_TOKEN, foreign, { repositoryUrl: `github.com/${owner}/${foreign}`, commitSha: "abcdef1" });
+    fakes.datadog.gitTags(TEST_SECRETS.GAP_DATADOG_TOKEN, own, { repositoryUrl: `github.com/acme/${own}`, commitSha: "abcdef1" });
+
+    await sendWebhook(alertFor(foreign));
+
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(2));
+    const [report] = reports();
+    expect(report.text).toContain(`repo not enabled: the owner ${owner} of ${owner}/${foreign} is not allowed for Org gap`);
+    const [reminder] = fakes.teams.posts.filter((p) => p !== report);
+    expect(reminder.text).toContain(`Repo not enabled: ${owner}/${foreign}`);
+    expect(reminder.text).toContain("allowed");
+    expect(fakes.github.calls).toEqual([]); // no installation lookup, no token, no clone
+    expect(fakes.workspace.checkouts).toEqual([]);
+
+    await sendWebhook(alertFor(own)); // an allowed owner, matched case-insensitively
+    await waitFor(() => expect(reports()).toHaveLength(2));
+    expect(reports()[1].text).toContain(`acme/${own} at deployed commit abcdef1`);
   });
 
   it("treats a repo as enabled once the GitHub App is installed on it (selected repos)", async () => {

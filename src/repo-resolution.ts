@@ -1,4 +1,4 @@
-import type { OncallConfig } from "./config";
+import { orgByName, type OncallConfig } from "./config";
 import type { DatadogConnection } from "./datadog-mcp";
 import { appInstallationFor, githubRepoFromUrl, repoName } from "./github";
 import type { Alert } from "./intake";
@@ -18,12 +18,15 @@ export type RepoResolution =
    */
   | { outcome: "unmapped"; service?: string; reason?: string }
   /**
-   * Repo not enabled: git tags found, but the GitHub App is not installed on the repo, or the repo is not on
-   * GitHub. `repo` is `owner/name` on GitHub, else only the host and path of the URL (never userinfo or query).
+   * Repo not enabled: git tags found, but the repo is not on GitHub, its owner is not one the Org allows
+   * (`allowedRepoOwners`), or the GitHub App is not installed on it. `repo` is `owner/name` on GitHub, else only
+   * the host and path of the URL (never userinfo or query).
    */
-  | { outcome: "not-enabled"; service: string; repo: string; onGitHub: boolean; sha: string }
+  | { outcome: "not-enabled"; service: string; repo: string; why: NotEnabledReason; sha: string }
   /** The lookup itself failed (Datadog or GitHub unreachable); the Investigation goes on without code. */
   | { outcome: "unresolved"; service?: string; reason: string };
+
+export type NotEnabledReason = "not-on-github" | "owner-not-allowed" | "not-installed";
 
 /** The Datadog MCP tool that returns spans with their tags; `git.*` is in its default attribute set. */
 export const SPANS_TOOL = "search_datadog_spans";
@@ -62,7 +65,12 @@ export async function resolveRepo(
   }
   const [tags] = found as [GitTags];
   const repo = githubRepoFromUrl(tags.repositoryUrl);
-  if (!repo) return { outcome: "not-enabled", service, repo: repoDisplay(tags.repositoryUrl), onGitHub: false, sha: tags.sha };
+  if (!repo) return { outcome: "not-enabled", service, repo: repoDisplay(tags.repositoryUrl), why: "not-on-github", sha: tags.sha };
+  // Before any GitHub call: a repo of an owner the Org does not allow is never looked up, cloned or written to.
+  const allowed = orgByName(config, alert.org)?.allowedRepoOwners;
+  if (allowed && !allowed.some((owner) => owner.toLowerCase() === repo.owner.toLowerCase())) {
+    return { outcome: "not-enabled", service, repo: repoName(repo), why: "owner-not-allowed", sha: tags.sha };
+  }
   let installationId: number | undefined;
   try {
     installationId = await appInstallationFor(env, config, repo);
@@ -70,7 +78,7 @@ export async function resolveRepo(
     return { outcome: "unresolved", service, reason: `checking the GitHub App installation failed: ${message(error)}` };
   }
   if (installationId === undefined) {
-    return { outcome: "not-enabled", service, repo: repoName(repo), onGitHub: true, sha: tags.sha };
+    return { outcome: "not-enabled", service, repo: repoName(repo), why: "not-installed", sha: tags.sha };
   }
   const repoUrl = `https://github.com/${repoName(repo)}`;
   return { outcome: "resolved", service, repo: repoName(repo), repoUrl, sha: tags.sha, installationId };
@@ -188,24 +196,33 @@ const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` 
 const message = (error: unknown) => cut(error instanceof Error ? error.message : String(error), 300);
 
 /** The Investigation report's line about the code: what was resolved, or why there is none. */
-export function codeLine(resolution: RepoResolution): string {
+export function codeLine(org: string, resolution: RepoResolution): string {
   switch (resolution.outcome) {
     case "resolved":
       return `Code: ${resolution.repo} at deployed commit ${resolution.sha}.`;
-    case "unmapped": {
-      const why = resolution.reason
-        ? resolution.reason
-        : resolution.service
-          ? `service ${resolution.service} has no source code integration git tags`
-          : "the monitor names no service";
-      return `Code: Unmapped service: ${why}, so its code was not read and no Agent PR can be opened.`;
-    }
+    case "unmapped":
+      return `Code: Unmapped service: ${unmappedWhy(resolution)}, so its code was not read and no Agent PR can be opened.`;
     case "not-enabled":
-      return resolution.onGitHub
-        ? `Code: repo not enabled: the GitHub App is not installed on ${resolution.repo}, so its code was not read and no Agent PR can be opened.`
-        : `Code: repo not enabled: the repository ${resolution.repo} is not on GitHub, so its code was not read and no Agent PR can be opened.`;
+      return `Code: repo not enabled: ${notEnabledWhy(org, resolution)}, so its code was not read and no Agent PR can be opened.`;
     case "unresolved":
       return `Code: not read: ${resolution.reason}.`;
+  }
+}
+
+function unmappedWhy(resolution: Extract<RepoResolution, { outcome: "unmapped" }>): string {
+  if (resolution.reason) return resolution.reason;
+  return resolution.service ? `service ${resolution.service} has no source code integration git tags` : "the monitor names no service";
+}
+
+/** Why a repo is not enabled, in words for messages. */
+function notEnabledWhy(org: string, resolution: Extract<RepoResolution, { outcome: "not-enabled" }>): string {
+  switch (resolution.why) {
+    case "not-on-github":
+      return `the repository ${resolution.repo} is not on GitHub`;
+    case "owner-not-allowed":
+      return `the owner ${resolution.repo.split("/")[0]} of ${resolution.repo} is not allowed for Org ${org}`;
+    case "not-installed":
+      return `the GitHub App is not installed on ${resolution.repo}`;
   }
 }
 
@@ -216,49 +233,83 @@ export interface Reminder {
   message: TeamsMessage;
 }
 
-export function reminderFor(org: string, resolution: RepoResolution): Reminder | undefined {
-  if (resolution.outcome === "unmapped" && resolution.service && !resolution.reason) {
-    // Per Org and service. Without a service tag there is nothing to add git tags to, and when the tags exist but
-    // disagree, "add git tags" would be wrong advice: no reminder in either case.
+/** What fixes each case, for the reminder. */
+const NOT_ENABLED_FIX: Record<NotEnabledReason, string> = {
+  "not-on-github": "Only GitHub repos with the oncall agent's GitHub App installed can be read.",
+  "owner-not-allowed": "Only repos of the owners allowed for the Org can be read; ask the oncall agent's maintainers to allow the owner if it should be.",
+  "not-installed": "Install the GitHub App on the repo to opt it in.",
+};
+
+/**
+ * The reminder for an Unmapped service or a repo not enabled. Unmapped: per Org and service, or per Org and
+ * monitor when the monitor names no service. Repo not enabled: per repo across Orgs, except an owner one Org does
+ * not allow, which is per Org and repo.
+ */
+export function reminderFor(alert: { org: string; monitorId: string }, resolution: RepoResolution): Reminder | undefined {
+  const { org } = alert;
+  if (resolution.outcome === "unmapped") return unmappedReminder(alert, resolution);
+  if (resolution.outcome !== "not-enabled") return undefined;
+  const repo = resolution.repo.toLowerCase();
+  return {
+    kind: "repo-reminder",
+    key: resolution.why === "owner-not-allowed" ? `repo-owner-not-allowed:${org}:${repo}` : `repo-not-enabled:${repo}`,
+    message: {
+      title: `Repo not enabled: ${resolution.repo}`,
+      lines: [
+        `The repo of service ${resolution.service} cannot be used: ${notEnabledWhy(org, resolution)}. So the oncall agent cannot read its code or propose Agent PRs.`,
+        `${NOT_ENABLED_FIX[resolution.why]} Investigation reports still arrive meanwhile.`,
+      ],
+      facts: [
+        ["Repo", resolution.repo],
+        ["Service", resolution.service],
+        ["Org", org],
+      ],
+    },
+  };
+}
+
+function unmappedReminder(
+  { org, monitorId }: { org: string; monitorId: string },
+  resolution: Extract<RepoResolution, { outcome: "unmapped" }>,
+): Reminder {
+  const service = resolution.service;
+  if (!service) {
     return {
       kind: "unmapped-reminder",
-      key: `unmapped:${org}:${resolution.service}`,
+      key: `unmapped:${org}:monitor:${monitorId}`,
       message: {
-        title: `Unmapped service: ${resolution.service}`,
+        title: `Unmapped service: monitor ${monitorId} names no service`,
         lines: [
-          `Service ${resolution.service} in Org ${org} has no Datadog source code integration git tags (git.repository_url and git.commit.sha), so the oncall agent cannot find its code or propose Agent PRs.`,
-          "Add the tags to the service's telemetry, for example by setting DD_GIT_REPOSITORY_URL and DD_GIT_COMMIT_SHA at build or deploy time. Investigation reports still arrive meanwhile.",
+          `Monitor ${monitorId} in Org ${org} names no service (no service tag, and no service in its group), so the oncall agent cannot look up the service's code or propose Agent PRs.`,
+          "Add a service:<name> tag to the monitor, or group it by service. Investigation reports still arrive meanwhile.",
         ],
         facts: [
           ["Org", org],
-          ["Service", resolution.service],
+          ["Monitor", monitorId],
         ],
       },
     };
   }
-  if (resolution.outcome === "not-enabled") {
-    // Per repo, across Orgs and services.
-    return {
-      kind: "repo-reminder",
-      key: `repo-not-enabled:${resolution.repo.toLowerCase()}`,
-      message: {
-        title: `Repo not enabled: ${resolution.repo}`,
-        lines: resolution.onGitHub
-          ? [
-              `The oncall agent's GitHub App is not installed on ${resolution.repo}, the repo of service ${resolution.service}, so the agent cannot read its code or propose Agent PRs.`,
-              "Install the GitHub App on the repo to opt it in. Investigation reports still arrive meanwhile.",
-            ]
-          : [
-              `The repository ${resolution.repo} of service ${resolution.service} is not on GitHub, so the oncall agent cannot read its code or propose Agent PRs.`,
-              "Only GitHub repos with the oncall agent's GitHub App installed can be read. Investigation reports still arrive meanwhile.",
-            ],
-        facts: [
-          ["Repo", resolution.repo],
-          ["Service", resolution.service],
-          ["Org", org],
-        ],
-      },
-    };
-  }
-  return undefined;
+  const lines = resolution.reason
+    ? [
+        `Service ${service} in Org ${org} cannot be mapped to its code: ${resolution.reason}. So the oncall agent cannot pick its code or propose Agent PRs.`,
+        "Make every deployment of the service report the same DD_GIT_REPOSITORY_URL and DD_GIT_COMMIT_SHA as the code it runs. Investigation reports still arrive meanwhile.",
+      ]
+    : [
+        `Service ${service} in Org ${org} has no Datadog source code integration git tags (git.repository_url and git.commit.sha), so the oncall agent cannot find its code or propose Agent PRs.`,
+        "Add the tags to the service's telemetry, for example by setting DD_GIT_REPOSITORY_URL and DD_GIT_COMMIT_SHA at build or deploy time. Investigation reports still arrive meanwhile.",
+      ];
+  return {
+    kind: "unmapped-reminder",
+    key: `unmapped:${org}:${service}`,
+    message: {
+      title: `Unmapped service: ${service}`,
+      lines,
+      facts: [
+        ["Org", org],
+        ["Service", service],
+      ],
+    },
+  };
 }
+
