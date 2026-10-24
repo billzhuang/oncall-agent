@@ -60,7 +60,7 @@ describe("Investigation report", () => {
     const [post] = fakes.teams.posts;
     expect(post.channel).toBe("sre");
     expect(post.text).toContain("Error rate on checkout above 5%");
-    expect(post.text).toContain("NullPointerException in CheckoutController.placeOrder");
+    expect(post.text).toContain("NullPointerException in CheckoutController[.]placeOrder"); // every dot is defanged
     expect(post.text).toContain("A null customer record reaches CheckoutController");
     expect(actionUrls(post.body)).toEqual([alert.link]);
     expect(fakes.datadog.calls.map((c) => c.tool)).toEqual(["search_datadog_logs"]);
@@ -105,6 +105,27 @@ describe("Teams messages are plain text", () => {
     expectInert(cardBodyText(post.body));
     expect(cardBodyText(post.body)).toContain("evil[.]example"); // still readable, defanged
     expect(cardBodyText(post.body)).toContain("Rotate");
+  });
+
+  it("defangs domains under any TLD, and Unicode dot lookalikes", async () => {
+    fakes.model.script(
+      investigate({
+        report: () => ({
+          whatFired: "Visit evil.support or login.evil.zone now",
+          evidence: ["Fullwidth evil．example, ideographic evil。example, halfwidth evil｡example"],
+          suspectedCause: "unknown",
+        }),
+      }),
+    );
+
+    await sendWebhook(alertPayload());
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    const raw = cardBodyText(fakes.teams.posts[0].body);
+    expect(raw).not.toMatch(/evil\.support|evil\.zone|login\.evil/);
+    expect(raw).not.toMatch(/[。．｡]/);
+    expect(raw).toContain("evil[.]support");
+    expect(raw).toContain("evil[.]example");
   });
 
   it("defangs bare URLs and <url> autolinks in the alert title", async () => {

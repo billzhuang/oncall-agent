@@ -136,7 +136,7 @@ describe("Unmapped service", () => {
     const [reminder] = fakes.teams.posts.filter((p) => p !== report);
     expect(reminder.channel).toBe("sre");
     expect(reminder.text).toContain(`Unmapped service: ${service}`);
-    const shown = reminder.text.replace(/\\(.)/g, "$1"); // as Teams shows it: markdown escapes removed
+    const shown = reminder.text.replace(/\\(.)/g, "$1").replace(/\[\.\]/g, "."); // read past escapes and defanging
     expect(shown).toContain("git.repository_url");
     expect(shown).toContain("git.commit.sha");
     expect(fakes.github.calls).toEqual([]); // no installation lookup, no workspace, no Agent PR

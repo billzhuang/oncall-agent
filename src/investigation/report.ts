@@ -59,7 +59,8 @@ export function reportMessage(
       `Suspected cause: ${report.suspectedCause}`,
       ...(code ? [code] : []),
     ],
-    facts: [...episodeFacts(alert), ...recordFacts(record)],
+    facts: episodeFacts(alert),
+    measures: recordFacts(record),
     links: monitorLinks(alert),
   };
 }
@@ -69,6 +70,19 @@ export function failedMessage(alert: Alert, reason: string, record: Investigatio
   return {
     title: `Investigation failed: ${alertName(alert)}`,
     lines: [`Failed: ${reason}. Nothing was found or concluded; please investigate this alert yourself.`, ...(code ? [code] : [])],
+    facts: episodeFacts(alert),
+    measures: recordFacts(record),
+    links: monitorLinks(alert),
+  };
+}
+
+/** The message when the monitor recovers while its Investigation is running: the Investigation stops there. */
+export function stoppedMessage(alert: Alert, record: InvestigationRecord): TeamsMessage {
+  return {
+    title: `Investigation stopped on recovery: ${alertName(alert)}`,
+    lines: [
+      "Stopped: the monitor recovered while the Investigation was running, so it was stopped without an Investigation report. An Agent PR already opened for this monitor group stays open for review.",
+    ],
     facts: [...episodeFacts(alert), ...recordFacts(record)],
     links: monitorLinks(alert),
   };
