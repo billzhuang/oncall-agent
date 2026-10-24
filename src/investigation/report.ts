@@ -65,6 +65,18 @@ export function failedMessage(alert: Alert, reason: string, record: Investigatio
   };
 }
 
+/** The message when the monitor recovers while its Investigation is running: the Investigation stops there. */
+export function stoppedMessage(alert: Alert, record: InvestigationRecord): TeamsMessage {
+  return {
+    title: `Investigation stopped on recovery: ${alertName(alert)}`,
+    lines: [
+      "Stopped: the monitor recovered while the Investigation was running, so it was stopped without an Investigation report. An Agent PR already opened for this monitor group stays open for review.",
+    ],
+    facts: [...episodeFacts(alert), ...recordFacts(record)],
+    links: monitorLinks(alert),
+  };
+}
+
 function alertName(alert: Alert): string {
   return alert.title || `monitor ${alert.monitorId}`;
 }

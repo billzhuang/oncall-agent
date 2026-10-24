@@ -89,8 +89,10 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
 
   // Ignored notifications still answer 2xx, or Datadog would retry them. None of them touches a Durable Object.
   if (!payload.tags.includes(OPT_IN_TAG)) return reply(202, "ignored: not an Opted-in monitor");
-  // Only Triggered starts an Investigation. Recovered is ignored until #3 routes it to the Investigation.
-  if (payload.transition !== "Triggered") return reply(202, `ignored: ${payload.transition} transition`);
+  // Triggered starts (or joins) an Investigation; Recovered closes its Alert episode. Warn and No Data are ignored.
+  if (payload.transition !== "Triggered" && payload.transition !== "Recovered") {
+    return reply(202, `ignored: ${payload.transition} transition`);
+  }
 
   const alert: Alert = {
     org: org.name,
@@ -103,7 +105,8 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     title: payload.title,
     date: payload.date,
   };
-  const outcome = await investigationStub(env, alert).triggered(alert);
+  const investigation = investigationStub(env, alert);
+  const outcome = alert.transition === "Recovered" ? await investigation.recovered(alert) : await investigation.triggered(alert);
   return reply(202, outcome);
 }
 
