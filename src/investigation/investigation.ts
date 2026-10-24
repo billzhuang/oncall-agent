@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
-import { orgByName, type Org } from "../config";
+import { orgByName, type OncallConfig, type Org } from "../config";
 import type { InvestigationRef } from "../coordinator";
 import { DatadogConnection, type DatadogToolSpec } from "../datadog-mcp";
 import { coordinatorStub } from "../durable";
@@ -21,8 +21,10 @@ import {
   type AgentHost,
   type WorkspaceTools,
 } from "./agent";
+import { agentBranch, pushAgentPr, reportOnly, retryable, type AgentPrRecord } from "./agent-pr";
 import {
   MAX_EVIDENCE_LINES,
+  agentPrBody,
   boundedReport,
   budgetExhaustedMessage,
   evidenceLine,
@@ -98,6 +100,10 @@ const evidencePrefix = (e: Episode) => `evidence:${e.number}:`;
 const repoKey = (e: Episode) => `repo:${e.number}`;
 /** The episode's WorkspaceState: whether its code is checked out (never the token used to clone it). */
 const workspaceKey = (e: Episode) => `workspace:${e.number}`;
+/** The episode's AgentPrRecord; its GitHub steps are recorded under `${agentPrKey}:<step>`. */
+const agentPrKey = (e: Episode) => `outbox:${e.number}:agent-pr`;
+/** Tries of the finalize job before a GitHub failure is reported instead of retried. */
+const AGENT_PR_ATTEMPTS = 4;
 /** Whether the Coordinator granted this episode's reminder (decided once, so a retried run job keeps the answer). */
 const reminderClaimKey = (e: Episode) => `reminder-claim:${e.number}`;
 /** The agent's one submission per Alert episode; pi ignores a second submit with the same id. */
@@ -382,9 +388,71 @@ export class Investigation extends DurableObject<Env> {
     // A report submitted before the interruption landed wins: the agent had finished its work.
     if (!report && interruption) return this.#endInterrupted(episode, interruption);
     if (!report) return this.#endWithoutReport(episode, await this.#runEndReason(episode));
+    // Before the report, so the report can link the Agent PR.
+    const agentPr = await this.#agentPr(episode, report);
     const record = await this.#record(episode);
-    await this.#notify(episode, "report", reportMessage(episode.alert, report, record, await this.#codeLine(episode)));
+    await this.#notify(episode, "report", reportMessage(episode.alert, report, record, await this.#codeLine(episode), agentPr));
     await this.#finish(episode, "Completed", record);
+  }
+
+  /**
+   * The Agent PR for a report that declares a fix, once per Alert episode (recorded; each GitHub step is recorded
+   * too, see `pushAgentPr`). Nothing without a declared fix or a checked-out workspace; nothing but a note under
+   * Report-only mode. A GitHub refusal, or a failure that persists past a few retries of this job, is recorded as
+   * failed so the report still goes out.
+   */
+  async #agentPr(episode: Episode, report: InvestigationReport): Promise<AgentPrRecord | undefined> {
+    const key = agentPrKey(episode);
+    const stored = await this.ctx.storage.get<AgentPrRecord>(key);
+    if (stored) return stored;
+    if (!report.fixProposed) return undefined;
+    const workspace = await this.ctx.storage.get<WorkspaceState>(workspaceKey(episode));
+    if (workspace?.outcome !== "ready") return undefined;
+    const config = ports().config(this.env);
+    const decided = await this.#proposeFix(episode, report, workspace, config);
+    await this.ctx.storage.put(key, decided);
+    return decided;
+  }
+
+  async #proposeFix(
+    episode: Episode,
+    report: InvestigationReport,
+    workspace: Extract<WorkspaceState, { outcome: "ready" }>,
+    config: OncallConfig,
+  ): Promise<AgentPrRecord> {
+    if (reportOnly(config, episode.alert.tags)) return { outcome: "report-only" };
+    const changes = await ports().workspace(this.ctx, this.env).changes();
+    if (changes.length === 0) return { outcome: "no-changes" };
+    const resolution = await this.ctx.storage.get<RepoResolution>(repoKey(episode));
+    const [owner = "", name = ""] = workspace.repo.split("/");
+    const { alert } = episode;
+    const prefix = `${agentPrKey(episode)}:`;
+    try {
+      return await pushAgentPr(
+        this.env,
+        config,
+        {
+          repo: { owner, name },
+          installationId: resolution?.outcome === "resolved" ? resolution.installationId : undefined,
+          deployedSha: workspace.sha,
+          branch: await agentBranch(alert),
+          changes,
+          title: `Agent PR: proposed fix for monitor ${alert.monitorId} (${alert.org})`,
+          commitMessage: `Proposed fix for monitor ${alert.monitorId} (${alert.org}) by the oncall agent`,
+          body: (drift) => agentPrBody(alert, report, { deployedSha: workspace.sha, changedPaths: changes.map((c) => c.path), drift }),
+        },
+        {
+          get: (step) => this.ctx.storage.get(`${prefix}${step}`),
+          put: (step, value) => this.ctx.storage.put(`${prefix}${step}`, value),
+        },
+      );
+    } catch (error) {
+      const failures = (await this.ctx.storage.get<number>("failures:finalize")) ?? 0;
+      if (retryable(error) && failures + 1 < AGENT_PR_ATTEMPTS) throw error; // the finalize job retries with backoff
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`Investigation ${this.lifecycle.name}: Agent PR failed: ${reason}`);
+      return { outcome: "failed", reason: reason.length > 300 ? `${reason.slice(0, 299)}…` : reason };
+    }
   }
 
   /**

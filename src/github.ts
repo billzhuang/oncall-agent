@@ -73,6 +73,130 @@ const HEADERS = {
   "user-agent": "oncall-agent",
 };
 
+/** A GitHub answer other than the one expected. Its message never holds a token. */
+export class GitHubError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** The only branches the harness ever writes (ADR 0002). */
+export const AGENT_BRANCH_PREFIX = "oncall-agent/";
+
+/**
+ * GitHub REST on one repo with an installation token, for the Agent PR: Git Data (blobs, trees, commits, refs),
+ * pulls and compare. The token stays inside: never in an error, a log line or a return value.
+ */
+export class RepoClient {
+  readonly #token: string;
+  constructor(
+    readonly repo: RepoRef,
+    token: string,
+  ) {
+    this.#token = token;
+  }
+
+  /** The head commit of a branch and its tree. */
+  async branchHead(branch: string): Promise<{ sha: string; treeSha: string }> {
+    const ref = await this.#call<{ object: { sha: string } }>("GET", `git/ref/heads/${branch}`);
+    const commit = await this.#call<{ tree: { sha: string } }>("GET", `git/commits/${ref.object.sha}`);
+    return { sha: ref.object.sha, treeSha: commit.tree.sha };
+  }
+
+  /** Paths that differ between two commits or branches (`base...head`). */
+  async changedFiles(base: string, head: string): Promise<string[]> {
+    const compare = await this.#call<{ files?: Array<{ filename: string; previous_filename?: string }> }>(
+      "GET",
+      `compare/${base}...${head}`,
+    );
+    return (compare.files ?? []).flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
+  }
+
+  /** One commit on top of `parent`: its tree with `changes` applied (`content: null` deletes the file). */
+  async commit(
+    parent: { sha: string; treeSha: string },
+    changes: ReadonlyArray<{ path: string; content: string | null }>,
+    message: string,
+  ): Promise<string> {
+    const tree = [];
+    for (const change of changes) {
+      if (change.content === null) {
+        tree.push({ path: change.path, mode: "100644", type: "blob", sha: null });
+        continue;
+      }
+      const blob = await this.#call<{ sha: string }>("POST", "git/blobs", { content: change.content, encoding: "utf-8" });
+      tree.push({ path: change.path, mode: "100644", type: "blob", sha: blob.sha });
+    }
+    const created = await this.#call<{ sha: string }>("POST", "git/trees", { base_tree: parent.treeSha, tree });
+    const commit = await this.#call<{ sha: string }>("POST", "git/commits", { message, tree: created.sha, parents: [parent.sha] });
+    return commit.sha;
+  }
+
+  /**
+   * Points an `oncall-agent/*` branch at `sha`: creates it, or moves it (force) when it exists. Idempotent: a
+   * branch already at `sha` is left alone. Refuses any other branch.
+   */
+  async pushAgentBranch(branch: string, sha: string): Promise<void> {
+    if (!branch.startsWith(AGENT_BRANCH_PREFIX) || branch.includes("..")) {
+      throw new Error(`refusing to write branch ${branch}: the harness writes only ${AGENT_BRANCH_PREFIX}* branches`);
+    }
+    const current = await this.#call<{ object: { sha: string } } | undefined>("GET", `git/ref/heads/${branch}`, undefined, [404]);
+    if (current?.object.sha === sha) return;
+    if (!current) {
+      const created = await this.#call("POST", "git/refs", { ref: `refs/heads/${branch}`, sha }, [422]);
+      if (created !== undefined) return;
+      // 422: created meanwhile (a replayed step); move it instead.
+    }
+    await this.#call("PATCH", `git/refs/heads/${branch}`, { sha, force: true });
+  }
+
+  /** The open pull request from `branch`, if any. */
+  async openPull(branch: string): Promise<{ number: number; html_url: string } | undefined> {
+    const head = encodeURIComponent(`${this.repo.owner}:${branch}`);
+    const pulls = await this.#call<Array<{ number: number; html_url: string }>>("GET", `pulls?head=${head}&state=open`);
+    return pulls[0];
+  }
+
+  /** Opens a draft pull request from `branch` into `base`. */
+  async createDraftPull(input: { branch: string; base: string; title: string; body: string }) {
+    return this.#call<{ number: number; html_url: string }>("POST", "pulls", {
+      title: input.title,
+      head: input.branch,
+      base: input.base,
+      body: input.body,
+      draft: true,
+    });
+  }
+
+  /** Replaces a pull request's title and description. */
+  async updatePull(number: number, input: { title: string; body: string }) {
+    return this.#call<{ number: number; html_url: string }>("PATCH", `pulls/${number}`, input);
+  }
+
+  /** One REST call; `tolerate` lists statuses answered with undefined instead of an error. */
+  async #call<T = unknown>(method: string, path: string, body?: unknown, tolerate: number[] = []): Promise<T> {
+    const res = await ports().fetch(`${API}/repos/${this.repo.owner}/${this.repo.name}/${path}`, {
+      method,
+      headers: {
+        ...HEADERS,
+        authorization: `Bearer ${this.#token}`,
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (tolerate.includes(res.status)) return undefined as T;
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      const message = detail.split(this.#token).join("[token]").slice(0, 200);
+      throw new GitHubError(res.status, `GitHub answered ${res.status} to ${method} ${path.split("?")[0]} on ${repoName(this.repo)}: ${message}`);
+    }
+    return (await res.json()) as T;
+  }
+}
+
 /** The App JWT last signed, reused for a few minutes: RSA signing is the slow part of every GitHub call. */
 let lastJwt: { pem: string; appId: string; iat: number; jwt: string } | undefined;
 /** How long a signed App JWT is reused (it is valid 9 minutes past `iat + 60`). */

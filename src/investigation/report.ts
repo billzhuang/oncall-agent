@@ -1,6 +1,7 @@
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { Alert } from "../intake";
 import { owningTeam, type TeamsMessage } from "../teams";
+import type { AgentPrRecord } from "./agent-pr";
 
 /** The structured Investigation report the agent submits through its finishing tool, `submit_report`. */
 export const ReportSchema = Type.Object({
@@ -49,7 +50,9 @@ export function reportMessage(
   report: InvestigationReport,
   record: InvestigationRecord,
   code?: string,
+  agentPr?: AgentPrRecord,
 ): TeamsMessage {
+  const pr = agentPr && agentPrLine(agentPr);
   return {
     title: `Investigation report: ${alertName(alert)}`,
     lines: [
@@ -58,11 +61,98 @@ export function reportMessage(
       ...(report.evidence.length ? report.evidence.map((e) => `• ${e}`) : ["• (none gathered)"]),
       `Suspected cause: ${report.suspectedCause}`,
       ...(code ? [code] : []),
+      ...(pr ? [pr] : []),
     ],
     facts: episodeFacts(alert),
     measures: recordFacts(record),
-    links: monitorLinks(alert),
+    links: [
+      ...monitorLinks(alert),
+      ...(agentPr?.outcome === "opened" || agentPr?.outcome === "updated" ? [{ title: "Open Agent PR", url: agentPr.url }] : []),
+    ],
   };
+}
+
+/** The report's line about the Agent PR. */
+function agentPrLine(pr: AgentPrRecord): string {
+  switch (pr.outcome) {
+    case "opened":
+    case "updated": {
+      const what = pr.outcome === "opened" ? "opened draft Agent PR" : "updated the open Agent PR";
+      const drift = pr.drift.length ? " Files it changes also changed on main since the deployed commit: see the PR." : "";
+      return `Agent PR: ${what} #${pr.number} from branch ${pr.branch} for Code owners to review.${drift}`;
+    }
+    case "report-only":
+      return "Agent PR: none, Report-only mode is on; the agent's proposed fix was not opened as a PR.";
+    case "no-changes":
+      return "Agent PR: none, the agent declared a fix but changed no file.";
+    case "failed":
+      return `Agent PR: could not be opened (${pr.reason}).`;
+  }
+}
+
+/**
+ * The Agent PR description, in GitHub markdown. Harness facts (monitor link, Owning team, drift warning) are built
+ * here; everything the model wrote, and every name from the alert or the workspace, is rendered as code, where
+ * GitHub makes no links, @mentions, #references or HTML.
+ */
+export function agentPrBody(
+  alert: Alert,
+  report: InvestigationReport,
+  input: { deployedSha: string; changedPaths: string[]; drift: string[] },
+): string {
+  const lines = [
+    `Draft Agent PR from the oncall agent for an Alert episode of monitor ${alert.monitorId} in Org ${codeSpan(alert.org)}. ` +
+      "Code owners: please review; the agent never merges.",
+    "",
+    `- Monitor: [Open monitor](<${alert.link}>)`,
+    `- Owning team: ${codeSpan(owningTeam(alert.tags) ?? "(no team tag)")}`,
+    `- Group: ${codeSpan(alert.group || "(none)")}`,
+    `- Deployed commit read: ${codeSpan(input.deployedSha)}; this branch is cut from \`main\`.`,
+    "",
+  ];
+  if (input.drift.length) {
+    lines.push(
+      "> [!WARNING]",
+      `> Drift: these files changed on \`main\` since the deployed commit: ${input.drift.map(codeSpan).join(", ")}. ` +
+        "The bug may already be fixed on `main`, and this PR's version of them is based on the deployed commit, so it may undo those changes.",
+      "",
+    );
+  }
+  lines.push(
+    "### Investigation report",
+    "",
+    "Written by the agent; shown as plain text.",
+    "",
+    codeBlock(
+      [
+        `What fired: ${report.whatFired}`,
+        "Evidence:",
+        ...(report.evidence.length ? report.evidence.map((e) => `- ${e}`) : ["- (none gathered)"]),
+        `Suspected cause: ${report.suspectedCause}`,
+      ].join("\n"),
+    ),
+    "",
+    `Files changed: ${input.changedPaths.map(codeSpan).join(", ")}`,
+    "",
+    "The Investigation report was also posted to the Owning team's Teams channel.",
+  );
+  return lines.join("\n");
+}
+
+/** Longest run of backticks in a text. */
+const longestBacktickRun = (text: string) => Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
+
+/** Inline code no text can close early: a fence longer than any backtick run inside (CommonMark code span). */
+function codeSpan(text: string): string {
+  const flat = text.replace(/[\r\n]+/g, " ");
+  const fence = "`".repeat(longestBacktickRun(flat) + 1);
+  return `${fence} ${flat} ${fence}`;
+}
+
+/** A fenced code block no line can close early: the fence is longer than any backtick run inside. */
+function codeBlock(text: string): string {
+  const fence = "`".repeat(Math.max(3, longestBacktickRun(text) + 1));
+  return `${fence}text\n${text.replace(/\r\n?/g, "\n")}\n${fence}`;
 }
 
 /** The message when an Investigation ends without an Investigation report. */
@@ -154,7 +244,7 @@ function recordFacts(record: InvestigationRecord): Array<[string, string]> {
 }
 
 /** The only link on Investigation messages: the monitor, a URL intake built from the Org's Datadog site. */
-function monitorLinks(alert: Alert): TeamsMessage["links"] {
+function monitorLinks(alert: Alert): NonNullable<TeamsMessage["links"]> {
   return alert.link ? [{ title: "Open monitor", url: alert.link }] : [];
 }
 
