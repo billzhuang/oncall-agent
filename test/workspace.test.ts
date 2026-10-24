@@ -264,6 +264,19 @@ describe("Code workspace", () => {
     expect(new Set(fakes.model.requests.flatMap((r) => r.tools)).has("read")).toBe(false);
   });
 
+  it("does not clone an abbreviated deployed commit: no token, and the report says why", async () => {
+    const service = `svc-${uniqueMonitorId()}`;
+    fakes.datadog.gitTags(TEST_SECRETS.GAP_DATADOG_TOKEN, service, { repositoryUrl: `github.com/acme/${service}`, commitSha: "abcdef1" });
+
+    await sendWebhook(alertFor(service));
+
+    await vi.waitFor(() => expect(reports()).toHaveLength(1));
+    expect(reports()[0]!.text).toContain("could not be checked out");
+    expect(reports()[0]!.text).toContain("not a full commit SHA");
+    expect(fakes.github.tokens).toEqual([]);
+    expect(fakes.workspace.checkouts).toEqual([]);
+  });
+
   it("keeps the workspace and its tools after eviction, without a second checkout or token", async () => {
     const service = deployedService();
     const held = gate();

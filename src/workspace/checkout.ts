@@ -26,6 +26,8 @@ export async function checkOutDeployedCommit(
   const repo: RepoRef = { owner, name: repoName };
   let token: string | undefined;
   try {
+    // A clone can only be pinned to a full SHA; an abbreviated one would need resolving on GitHub first.
+    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`the deployed commit ${sha} is not a full commit SHA`);
     const installationId = resolution.installationId ?? (await appInstallationFor(env, config, repo));
     if (installationId === undefined) throw new Error(`the GitHub App is no longer installed on ${name}`);
     token = await installationToken(env, config, installationId, repo, { contents: "read" });
