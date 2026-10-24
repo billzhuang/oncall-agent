@@ -80,6 +80,8 @@ const nudgedKey = (e: Episode) => `nudged:${e.number}`;
 const costBaselineKey = (e: Episode) => `cost-baseline:${e.number}`;
 const interruptedKey = (e: Episode) => `interrupted:${e.number}`;
 const freshContextKey = (e: Episode) => `fresh-context:${e.number}`;
+/** Set when a job gave up for good on this Alert episode (see `#abandon`). */
+const abandonedKey = (e: Episode) => `abandoned:${e.number}`;
 /** The agent's one submission per Alert episode; pi ignores a second submit with the same id. */
 const operationId = (e: Episode) => `episode:${e.number}`;
 
@@ -206,6 +208,14 @@ export class Investigation extends DurableObject<Env> {
     if (!episode || episode.number !== episodeNumber || episode.status !== "Queued") return false;
     await this.#start(episode);
     return true;
+  }
+
+  /** Whether this Alert episode's Investigation has yet to finish: the Coordinator asks before reclaiming its slot. */
+  async stillRunning(episodeNumber: number): Promise<boolean> {
+    await this.lifecycle.start();
+    const episode = await this.#episode();
+    if (!episode || episode.number !== episodeNumber || finished(episode.status)) return false;
+    return !(await this.ctx.storage.get(abandonedKey(episode)));
   }
 
   async onJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
@@ -387,8 +397,24 @@ export class Investigation extends DurableObject<Env> {
       const failures = ((await this.ctx.storage.get<number>(key)) ?? 0) + 1;
       await this.ctx.storage.put(key, failures);
       console.error(`Investigation ${this.lifecycle.name}: job ${jobId} failed (${failures})`, error);
-      if (failures >= MAX_JOB_FAILURES) return; // give up; #4 reports Failed investigations
+      if (failures >= MAX_JOB_FAILURES) return this.#abandon(); // give up; #4 reports Failed investigations
       return { rescheduleAt: Date.now() + Math.min(1_000 * 2 ** (failures - 1), 5 * 60_000) };
+    }
+  }
+
+  /**
+   * A job gave up for good: hands back the run slot and reports the spend so far to the daily budget, so neither
+   * waits for a finish that may never come. Best effort: if the Coordinator cannot be reached either, its lease
+   * lapses and the up-front charge stands.
+   */
+  async #abandon(): Promise<void> {
+    const episode = await this.#episode();
+    if (!episode || finished(episode.status)) return;
+    await this.ctx.storage.put(abandonedKey(episode), true);
+    try {
+      await coordinatorStub(this.env).release(this.#ref(episode), (await this.#record(episode)).costUsd);
+    } catch (error) {
+      console.error(`Investigation ${this.lifecycle.name}: could not hand back its run slot`, error);
     }
   }
 
