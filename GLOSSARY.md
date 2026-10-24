@@ -27,7 +27,7 @@ The people responsible for the files an Agent PR changes; they review it.
 _Avoid_: Reviewers, maintainers
 
 **Unmapped service**:
-A service whose alerts carry no Datadog link to its source repository, so the agent cannot find its code.
+A service the agent cannot tie, through Datadog, to one source repository and deployed version (no link at all, conflicting links, or no service named on the monitor), so it cannot find its code.
 _Avoid_: Unknown repo, orphan service
 
 **Alert episode**:
