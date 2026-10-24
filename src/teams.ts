@@ -56,13 +56,21 @@ export async function postToTeams(env: Env, channelSecret: string, message: Team
   if (!res.ok) throw new Error(`Teams webhook ${channelSecret} answered ${res.status}`);
 }
 
+/**
+ * Message text includes untrusted alert text, and Adaptive Card text renders a markdown subset, so break
+ * markdown link syntax: links appear only as the card's own actions, built from trusted URLs.
+ */
+function inert(text: string): string {
+  return text.replace(/\]\s*\(/g, "] (");
+}
+
 function adaptiveCard(message: TeamsMessage) {
   const body: unknown[] = [
-    { type: "TextBlock", text: message.title, weight: "Bolder", size: "Medium", wrap: true },
-    ...message.lines.map((text) => ({ type: "TextBlock", text, wrap: true })),
+    { type: "TextBlock", text: inert(message.title), weight: "Bolder", size: "Medium", wrap: true },
+    ...message.lines.map((text) => ({ type: "TextBlock", text: inert(text), wrap: true })),
   ];
   if (message.facts?.length) {
-    body.push({ type: "FactSet", facts: message.facts.map(([title, value]) => ({ title, value })) });
+    body.push({ type: "FactSet", facts: message.facts.map(([title, value]) => ({ title: inert(title), value: inert(value) })) });
   }
   const content: Record<string, unknown> = {
     $schema: "http://adaptivecards.io/schemas/adaptive-card.json",

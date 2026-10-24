@@ -14,6 +14,7 @@ describe("Alert to Teams", () => {
     const res = await sendWebhook(alert);
 
     expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ outcome: "opened" });
     await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     const [post] = fakes.teams.posts;
     expect(post.channel).toBe("sre");
@@ -41,6 +42,14 @@ describe("Alert to Teams", () => {
     await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     expect(fakes.teams.posts[0].text).toContain(`https://app.datadoghq.eu/monitors/${monitorId}`);
     expect(fakes.teams.posts[0].text).not.toContain("evil.example");
+  });
+
+  it("does not let alert text add links to the Teams message", async () => {
+    await sendWebhook(alertPayload({ title: "Disk full [click to fix](https://evil.example/login)" }));
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    expect(fakes.teams.posts[0].text).toContain("click to fix");
+    expect(fakes.teams.posts[0].text).not.toContain("](https://evil.example");
   });
 
   it("keeps a webhook monitor link that points at the Org's Datadog site", async () => {
@@ -177,6 +186,7 @@ describe("Alert episodes", () => {
     const res = await sendWebhook(alert);
 
     expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ outcome: "duplicate" });
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
   });
@@ -184,8 +194,10 @@ describe("Alert episodes", () => {
   it("has no extra effect when the duplicate arrives before the report is posted", async () => {
     const alert = alertPayload();
 
-    await Promise.all([sendWebhook(alert), sendWebhook(alert)]);
+    const responses = await Promise.all([sendWebhook(alert), sendWebhook(alert)]);
 
+    const outcomes = await Promise.all(responses.map((r) => r.json()));
+    expect(outcomes).toEqual(expect.arrayContaining([{ outcome: "opened" }, { outcome: "duplicate" }]));
     await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
@@ -202,6 +214,7 @@ describe("Alert episodes", () => {
       const res = await sendWebhook(alertPayload({ monitorId, transition }));
 
       expect(res.status).toBe(202);
+      expect(await res.json()).toEqual({ outcome: "joined" });
       await settle();
       expect(fakes.teams.posts).toHaveLength(1);
     },
