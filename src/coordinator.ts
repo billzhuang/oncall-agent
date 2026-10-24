@@ -3,6 +3,9 @@ import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
 import { investigationStubByName } from "./durable";
 import { ports } from "./ports";
 
+/** At most one reminder per key (Unmapped service per Org and service, repo not enabled per repo) in this window. */
+const REMINDER_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** One Alert episode's Investigation, as the Coordinator knows it: its Durable Object name and episode number. */
 export interface InvestigationRef {
   name: string;
@@ -243,5 +246,20 @@ export class Coordinator extends DurableObject<Env> {
     await this.lifecycle.start();
     const storageKey = `daily-notice:${key}`;
     if ((await this.ctx.storage.get<string>(storageKey)) === day) await this.ctx.storage.delete(storageKey);
+  }
+
+  /**
+   * Reminder dedup ledger: claims the reminder `key` (`unmapped:<org>:<service>` or `repo-not-enabled:<repo>`).
+   * True when no reminder for the key was claimed in the last 7 days (business clock), so the caller sends it;
+   * false otherwise, so the caller sends nothing.
+   */
+  async claimReminder(key: string): Promise<boolean> {
+    await this.lifecycle.start();
+    const storageKey = `reminder:${key}`;
+    const now = ports().now();
+    const last = await this.ctx.storage.get<number>(storageKey);
+    if (last !== undefined && now - last < REMINDER_INTERVAL_MS) return false;
+    await this.ctx.storage.put(storageKey, now);
+    return true;
   }
 }

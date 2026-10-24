@@ -19,6 +19,9 @@ export const WK_ORG_ID = "2002";
 
 export const MODEL_ID = "@cf/deepseek-ai/deepseek-v4.1-flash-1017";
 
+/** The test GitHub App. Its key pair is generated per run in vitest.config.ts (private key as a Worker secret). */
+export const GITHUB_APP_ID = "123456";
+
 /** Raw ONCALL_CONFIG for tests; goes through the real parser. Shallow overrides per top-level key. */
 export function testConfig(overrides: Record<string, unknown> = {}) {
   return {
@@ -43,6 +46,7 @@ export function testConfig(overrides: Record<string, unknown> = {}) {
       },
     ],
     teams: { sre: "TEAMS_SRE_URL", payments: "TEAMS_PAYMENTS_URL" },
+    github: { appId: GITHUB_APP_ID, privateKeySecret: "GITHUB_APP_PRIVATE_KEY" },
     reportOnly: { global: true, teams: {} },
     modelId: MODEL_ID,
     budgets: { investigationUsd: 3, investigationMinutes: 30, dailyUsd: 30, maxConcurrent: 5 },

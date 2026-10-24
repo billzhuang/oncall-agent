@@ -62,6 +62,13 @@ const ConfigSchema = z
     orgs: z.array(OrgSchema).min(1),
     /** Owning team (the monitor's `team` tag value) -> Worker secret holding its Teams Workflows webhook URL. */
     teams: z.record(z.string().min(1), SecretName).default({}),
+    /** The GitHub App the harness (never the agent) uses to reach repos (ADR 0002). */
+    github: z.object({
+      /** The App's ID: the `iss` of its App JWTs. */
+      appId: z.string().regex(/^\d+$/),
+      /** Worker secret holding the App's private key as a PKCS#8 PEM (`openssl pkcs8 -topk8 -nocrypt -in app.pem`). */
+      privateKeySecret: SecretName,
+    }),
     /** Report-only mode: `global`, overridden per Owning team where `teams` names it. */
     reportOnly: z
       .object({

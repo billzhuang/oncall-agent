@@ -40,8 +40,16 @@ export interface InvestigationRecord {
   durationMs: number;
 }
 
-/** The Investigation report as a Teams message. All text is untrusted; teams.ts renders it as plain text. */
-export function reportMessage(alert: Alert, report: InvestigationReport, record: InvestigationRecord): TeamsMessage {
+/**
+ * The Investigation report as a Teams message. All text is untrusted; teams.ts renders it as plain text.
+ * `code`: the line repo resolution contributes (what code was read, or why none), when it ran.
+ */
+export function reportMessage(
+  alert: Alert,
+  report: InvestigationReport,
+  record: InvestigationRecord,
+  code?: string,
+): TeamsMessage {
   return {
     title: `Investigation report: ${alertName(alert)}`,
     lines: [
@@ -49,6 +57,7 @@ export function reportMessage(alert: Alert, report: InvestigationReport, record:
       "Evidence:",
       ...(report.evidence.length ? report.evidence.map((e) => `• ${e}`) : ["• (none gathered)"]),
       `Suspected cause: ${report.suspectedCause}`,
+      ...(code ? [code] : []),
     ],
     facts: episodeFacts(alert),
     measures: recordFacts(record),
@@ -57,10 +66,10 @@ export function reportMessage(alert: Alert, report: InvestigationReport, record:
 }
 
 /** The message when an Investigation ends without an Investigation report. */
-export function failedMessage(alert: Alert, reason: string, record: InvestigationRecord): TeamsMessage {
+export function failedMessage(alert: Alert, reason: string, record: InvestigationRecord, code?: string): TeamsMessage {
   return {
     title: `Investigation failed: ${alertName(alert)}`,
-    lines: [`Failed: ${reason}. Nothing was found or concluded; please investigate this alert yourself.`],
+    lines: [`Failed: ${reason}. Nothing was found or concluded; please investigate this alert yourself.`, ...(code ? [code] : [])],
     facts: episodeFacts(alert),
     measures: recordFacts(record),
     links: monitorLinks(alert),
