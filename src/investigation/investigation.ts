@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
-import { orgByName, type OncallConfig, type Org } from "../config";
+import { orgByName, pastTimeLimit, timeLimitMs, type Org } from "../config";
 import type { InvestigationRef } from "../coordinator";
 import { DatadogConnection, type DatadogToolSpec } from "../datadog-mcp";
 import { coordinatorStub } from "../durable";
@@ -131,7 +131,9 @@ const jobFailuresKey = (jobId: string) => `failures:${jobId}`;
 const jobLastErrorKey = (jobId: string) => `last-error:${jobId}`;
 
 /**
- * One Investigation per Alert episode `(org, monitor, group)`; named by `durable.ts`.
+ * One Durable Object per monitor group `(org, monitor, group)`, named by `durable.ts`. It hosts the successive Alert
+ * episodes of the group, one at a time, each with its own Investigation, so a later episode finds (and updates or
+ * links) the group's open Agent PR.
  *
  * The agent runs as a pi-durable session (PiHarness, see `agent.ts`). The Investigation gives it exactly one
  * input per Alert episode (job `run`), and once the run has ended, job `finalize` posts the outcome and
@@ -193,16 +195,17 @@ export class Investigation extends DurableObject<Env> {
       return "closed";
     }
     if (episode.status !== "Running") return "closed";
-    await this.interrupt({ status: "Stopped", reason: "the monitor recovered" });
+    await this.#interrupt({ status: "Stopped", reason: "the monitor recovered" });
     return "stopped";
   }
 
   /**
    * Interrupts the running agent: records why first (durable, so a crash before the abort is caught by
    * `#finalize`), aborts the run, then lets `#finalize` post the message and finish the Investigation.
-   * Call from an RPC or `onAlarm`, or un-awaited from a hook: abort waits for the run to go idle.
+   * For the `recovered` RPC: it awaits the abort, which waits for the run to go idle. Hooks and alarms use
+   * `#interruptFromRun`, which does not wait.
    */
-  private async interrupt(reason: Interruption): Promise<void> {
+  async #interrupt(reason: Interruption): Promise<void> {
     if ((await this.#flagInterruption(reason)) === "not-running") return;
     await this.harness.abort();
     await this.#scheduleFinalize();
@@ -234,7 +237,7 @@ export class Investigation extends DurableObject<Env> {
     const now = ports().now();
     const episode: Episode = { number, alert, openedAt: now, status: "Queued", retriggers: 0, lastTriggeredAt: now };
     await this.#save(episode);
-    await this.#start(episode);
+    await this.#askForRunSlot();
   }
 
   /** Opens the Alert episode of a Triggered that arrived while the previous episode was being stopped. */
@@ -258,7 +261,7 @@ export class Investigation extends DurableObject<Env> {
    * Queued: asks the Coordinator for a run slot. A durable job, not inline: it survives eviction and a
    * Coordinator hiccup, and keeps Datadog round trips out of the webhook.
    */
-  async #start(_episode: Episode): Promise<void> {
+  async #askForRunSlot(): Promise<void> {
     await this.lifecycle.jobs.push({ id: "admit", fn: "admit", time: Date.now() });
   }
 
@@ -268,17 +271,17 @@ export class Investigation extends DurableObject<Env> {
    */
   async slotGranted(episodeNumber: number): Promise<boolean> {
     await this.lifecycle.start();
-    const episode = await this.#episode();
-    if (!episode || episode.number !== episodeNumber || episode.status !== "Queued") return false;
-    await this.#start(episode);
+    const episode = await this.#episodeNumbered(episodeNumber);
+    if (episode?.status !== "Queued") return false;
+    await this.#askForRunSlot();
     return true;
   }
 
   /** Whether this Alert episode's Investigation has yet to finish: the Coordinator asks before reclaiming its slot. */
   async stillRunning(episodeNumber: number): Promise<boolean> {
     await this.lifecycle.start();
-    const episode = await this.#episode();
-    if (!episode || episode.number !== episodeNumber || finished(episode.status)) return false;
+    const episode = await this.#episodeNumbered(episodeNumber);
+    if (!episode || finished(episode.status)) return false;
     return !(await this.ctx.storage.get(abandonedKey(episode)));
   }
 
@@ -288,12 +291,12 @@ export class Investigation extends DurableObject<Env> {
    */
   async overran(episodeNumber: number): Promise<void> {
     await this.lifecycle.start();
-    const episode = await this.#episode();
-    if (!episode || episode.number !== episodeNumber || episode.status !== "Running") return;
+    const episode = await this.#episodeNumbered(episodeNumber);
+    if (episode?.status !== "Running") return;
     const { budgets } = ports().config(this.env);
     await this.#interruptFromRun({
       status: "Partial",
-      reason: `time limit of ${budgets.investigationMinutes} minutes long passed and its run slot was taken back`,
+      reason: `time limit of ${budgets.investigationMinutes} minutes long passed and it was still running`,
     });
   }
 
@@ -306,7 +309,7 @@ export class Investigation extends DurableObject<Env> {
     await this.lifecycle.jobs.push({ id: "run", fn: "run", time: Date.now() });
     // A wake-up at the time limit (real time), so the limit holds even if the run is wedged between alarms.
     const { budgets } = ports().config(this.env);
-    await this.lifecycle.jobs.push({ id: "deadline", fn: "deadline", time: Date.now() + budgets.investigationMinutes * 60_000 });
+    await this.lifecycle.jobs.push({ id: "deadline", fn: "deadline", time: Date.now() + timeLimitMs(budgets.investigationMinutes) });
   }
 
   /** Every alarm (pi's heartbeat while the agent runs, job wake-ups otherwise) checks the time limit. */
@@ -319,7 +322,7 @@ export class Investigation extends DurableObject<Env> {
     const episode = await this.#episode();
     if (!episode || episode.status !== "Running" || episode.startedAt === undefined) return;
     const { budgets } = ports().config(this.env);
-    if (ports().now() - episode.startedAt < budgets.investigationMinutes * 60_000) return;
+    if (!pastTimeLimit(episode.startedAt, budgets.investigationMinutes, ports().now())) return;
     if (!(await this.ctx.storage.get(submittedKey(episode)))) {
       // The agent never got its input: the run job kept failing (e.g. Datadog MCP down). A crash, not a partial.
       const limit = `it did not start within ${budgets.investigationMinutes} minutes`;
@@ -373,7 +376,7 @@ export class Investigation extends DurableObject<Env> {
 
   /** This Alert episode's Investigation, as the Coordinator knows it. */
   #ref(episode: Episode): InvestigationRef {
-    return { name: this.lifecycle.name, episode: episode.number };
+    return { name: this.lifecycle.name, episodeNumber: episode.number };
   }
 
   /**
@@ -792,6 +795,12 @@ export class Investigation extends DurableObject<Env> {
 
   async #episode(): Promise<Episode | undefined> {
     return this.ctx.storage.get<Episode>(EPISODE);
+  }
+
+  /** The current Alert episode when it is the one the Coordinator asks about, else undefined (it has moved on). */
+  async #episodeNumbered(episodeNumber: number): Promise<Episode | undefined> {
+    const episode = await this.#episode();
+    return episode?.number === episodeNumber ? episode : undefined;
   }
 
   async #save(episode: Episode): Promise<void> {

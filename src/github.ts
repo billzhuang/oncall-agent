@@ -1,5 +1,6 @@
 import { secret, type OncallConfig } from "./config";
 import { ports } from "./ports";
+import { scrubSecret } from "./text";
 
 /**
  * GitHub, reached only by the harness with the GitHub App (ADR 0002): the agent never holds GitHub credentials.
@@ -211,7 +212,7 @@ export class RepoClient {
     if (tolerate.includes(res.status)) return undefined as T;
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
-      const message = detail.split(this.#token).join("[token]").slice(0, 200);
+      const message = scrubSecret(detail, this.#token).slice(0, 200);
       throw new GitHubError(res.status, `GitHub answered ${res.status} to ${method} ${path.split("?")[0]} on ${repoName(this.repo)}: ${message}`);
     }
     return (await res.json()) as T;

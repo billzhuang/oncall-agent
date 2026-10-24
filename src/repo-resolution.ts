@@ -3,6 +3,7 @@ import type { DatadogConnection } from "./datadog-mcp";
 import { appInstallationFor, githubRepoFromUrl, repoName, type RepoRef } from "./github";
 import type { Alert } from "./intake";
 import type { TeamsMessage } from "./teams";
+import { errorMessage, truncate } from "./text";
 
 /**
  * Repo resolution: before the agent starts, the harness (deterministic code, not the model) finds the code that
@@ -105,7 +106,7 @@ async function gitTagsOf(datadog: DatadogConnection, service: string): Promise<G
   const texts = (result.content as Array<{ type: string; text?: string }>)
     .filter((c) => c.type === "text")
     .map((c) => c.text ?? "");
-  if (result.isError) throw new Error(cut(texts.join(" ") || "tool error", 200));
+  if (result.isError) throw new Error(truncate(texts.join(" ") || "tool error", 200));
   const spans = [result.structuredContent, ...texts.map(parseJson)].map(spanList).find((list) => list !== undefined);
   if (!spans) throw new Error("the span search result is not structured data");
   const distinct = new Map<string, GitTags>();
@@ -184,8 +185,7 @@ export function repoDisplay(repositoryUrl: string): string {
   return host && /^[A-Za-z0-9.-]+(\/[A-Za-z0-9._~\/-]*)?$/.test(shown) ? shown : "(unreadable repository URL)";
 }
 
-const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
-const message = (error: unknown) => cut(error instanceof Error ? error.message : String(error), 300);
+const message = (error: unknown) => truncate(errorMessage(error), 300);
 
 /** The Investigation report's line about the code: what was resolved, or why there is none. */
 export function codeLine(org: string, resolution: RepoResolution): string {

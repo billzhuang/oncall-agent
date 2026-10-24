@@ -1,5 +1,6 @@
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { Alert } from "../intake";
+import { truncate } from "../text";
 import { owningTeam, type TeamsMessage } from "../teams";
 import type { AgentPrRecord } from "./agent-pr";
 
@@ -22,15 +23,14 @@ const LIMITS = { text: 2_000, evidenceLines: 20, evidenceLine: 1_000 };
 
 /** Bounds what the model submitted, so a runaway answer cannot break the Teams card. */
 export function boundedReport(report: InvestigationReport): InvestigationReport {
-  const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
   return {
-    whatFired: cut(report.whatFired.trim(), LIMITS.text),
+    whatFired: truncate(report.whatFired.trim(), LIMITS.text),
     evidence: report.evidence
       .map((e) => e.trim())
       .filter(Boolean)
       .slice(0, LIMITS.evidenceLines)
-      .map((e) => cut(e, LIMITS.evidenceLine)),
-    suspectedCause: cut(report.suspectedCause.trim(), LIMITS.text),
+      .map((e) => truncate(e, LIMITS.evidenceLine)),
+    suspectedCause: truncate(report.suspectedCause.trim(), LIMITS.text),
     fixProposed: report.fixProposed === true,
   };
 }
@@ -193,7 +193,7 @@ function codeBlock(text: string): string {
 export function failedMessage(alert: Alert, reason: string, record: InvestigationRecord, code?: string): TeamsMessage {
   return {
     title: `Investigation failed: ${alertName(alert)}`,
-    lines: [`Failed: ${reason}. Nothing was found or concluded; please investigate this alert yourself.`, ...(code ? [code] : [])],
+    lines: [`Failed: ${reason}. Nothing was found or concluded; please investigate this Alert episode yourself.`, ...(code ? [code] : [])],
     facts: episodeFacts(alert),
     measures: recordFacts(record),
     links: monitorLinks(alert),
@@ -217,7 +217,7 @@ export function budgetExhaustedMessage(alert: Alert): TeamsMessage {
   return {
     title: `Budget exhausted, not investigated: ${alertName(alert)}`,
     lines: [
-      "The oncall agent's daily spend budget is exhausted, so this alert was not investigated. " +
+      "The oncall agent's daily spend budget is exhausted, so this Alert episode was not investigated. " +
         "Please investigate it yourself. The budget resets at 00:00 UTC.",
     ],
     facts: episodeFacts(alert),
@@ -258,7 +258,7 @@ export function partialReportMessage(
 /** One line of evidence from a tool result, bounded so a partial message stays readable. */
 export function evidenceLine(tool: string, text: string): string {
   const line = `${tool}: ${text.replace(/\s+/g, " ").trim()}`;
-  return line.length > LIMITS.evidenceLine ? `${line.slice(0, LIMITS.evidenceLine - 1)}…` : line;
+  return truncate(line, LIMITS.evidenceLine);
 }
 
 /** At most this many evidence lines go on a partial message. */

@@ -12,6 +12,7 @@ import { PiHarness } from "agents/harness/pi";
 import { datadogTools, type DatadogConnection, type DatadogToolSpec } from "../datadog-mcp";
 import { repoName, type RepoRef } from "../github";
 import type { Alert } from "../intake";
+import { pastTimeLimit } from "../config";
 import { ports } from "../ports";
 import { ReportSchema, type InvestigationReport } from "./report";
 
@@ -112,7 +113,7 @@ function agentHooks(host: AgentHost): HookRegistration[] {
     let reason: string | undefined;
     if (limits.spentUsd >= limits.maxUsd) {
       reason = `cost cap of $${limits.maxUsd.toFixed(2)} reached ($${limits.spentUsd.toFixed(2)} spent)`;
-    } else if (ports().now() - limits.startedAt >= limits.maxMinutes * 60_000) {
+    } else if (pastTimeLimit(limits.startedAt, limits.maxMinutes, ports().now())) {
       reason = `time limit of ${limits.maxMinutes} minutes reached`;
     }
     if (reason) await host.interrupt(reason);

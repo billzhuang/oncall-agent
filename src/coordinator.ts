@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
 import { investigationStubByName } from "./durable";
+import { timeLimitMs } from "./config";
 import { ports } from "./ports";
 
 /** At most one reminder per key (Unmapped service per Org and service, repo not enabled per repo) in this window. */
@@ -9,7 +10,7 @@ const REMINDER_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 /** One Alert episode's Investigation, as the Coordinator knows it: its Durable Object name and episode number. */
 export interface InvestigationRef {
   name: string;
-  episode: number;
+  episodeNumber: number;
 }
 
 /** The Coordinator's answer to an Investigation asking to run. */
@@ -47,11 +48,13 @@ const HARD_CAP_SLACK_MS = 15 * 60_000;
 /** Retry delay when a queued Investigation could not be told it may run. Real time: only a wake-up. */
 const DISPATCH_RETRY_MS = 5_000;
 
-const same = (a: InvestigationRef, b: InvestigationRef) => a.name === b.name && a.episode === b.episode;
+const same = (a: InvestigationRef, b: InvestigationRef) => a.name === b.name && a.episodeNumber === b.episodeNumber;
 /** The UTC day (YYYY-MM-DD) of a business-clock time: the daily budget's ledger key. */
 const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 const spendKey = (day: string) => `spend:${day}`;
-const chargeKey = (ref: InvestigationRef) => `charge:${ref.name}#${ref.episode}`;
+/** An Investigation as logs and storage keys name it: `<Durable Object name>#<episode number>`. */
+const refLabel = (ref: InvestigationRef) => `${ref.name}#${ref.episodeNumber}`;
+const chargeKey = (ref: InvestigationRef) => `charge:${refLabel(ref)}`;
 
 /**
  * Coordinator (singleton): run slots (at most `budgets.maxConcurrent` Investigations running, the rest queued in
@@ -122,7 +125,7 @@ export class Coordinator extends DurableObject<Env> {
     if (job.fn === "stop") {
       // Throws if the Investigation cannot be reached, so Lifecycle retries the job.
       const ref = job.payload as InvestigationRef;
-      await investigationStubByName(this.env, ref.name).overran(ref.episode);
+      await investigationStubByName(this.env, ref.name).overran(ref.episodeNumber);
     }
   }
 
@@ -140,10 +143,10 @@ export class Coordinator extends DurableObject<Env> {
       if (!exhausted) await this.#grant(next);
       await this.#putQueue(queue.slice(1));
       try {
-        const waiting = await investigationStubByName(this.env, next.name).slotGranted(next.episode);
+        const waiting = await investigationStubByName(this.env, next.name).slotGranted(next.episodeNumber);
         if (!waiting && !exhausted) await this.#ungrant(next); // it finished meanwhile
       } catch (error) {
-        console.error(`Coordinator: could not start Investigation ${next.name}#${next.episode}`, error);
+        console.error(`Coordinator: could not start Investigation ${refLabel(next)}`, error);
         if (!exhausted) await this.#ungrant(next);
         const { queue: now } = await this.#state();
         if (!now.some((q) => same(q, next))) await this.#putQueue([next, ...now]);
@@ -157,7 +160,7 @@ export class Coordinator extends DurableObject<Env> {
   async #grant(ref: InvestigationRef): Promise<void> {
     const { slots } = await this.#state();
     const now = ports().now();
-    const slot: Slot = { name: ref.name, episode: ref.episode, grantedAt: now, leaseUntil: now + this.#timeLimitMs() + LEASE_SLACK_MS };
+    const slot: Slot = { name: ref.name, episodeNumber: ref.episodeNumber, grantedAt: now, leaseUntil: now + this.#timeLimitMs() + LEASE_SLACK_MS };
     await this.#putSlots([...slots.filter((s) => !same(s, ref)), slot]);
     if (await this.ctx.storage.get(chargeKey(ref))) return;
     const day = utcDay(ports().now());
@@ -189,18 +192,18 @@ export class Coordinator extends DurableObject<Env> {
     for (const slot of lapsed) {
       const hardCap = slot.grantedAt + this.#timeLimitMs() + HARD_CAP_SLACK_MS;
       if (now >= hardCap) {
-        console.warn(`Coordinator: Investigation ${slot.name}#${slot.episode} passed its run slot's hard cap; stopping it`);
+        console.warn(`Coordinator: Investigation ${refLabel(slot)} passed its run slot's hard cap; stopping it`);
         const { slots } = await this.#state();
         await this.#putSlots(slots.filter((s) => !same(s, slot)));
-        const ref: InvestigationRef = { name: slot.name, episode: slot.episode };
-        await this.lifecycle.jobs.push({ id: `stop:${slot.name}#${slot.episode}`, fn: "stop", payload: ref, time: Date.now() });
+        const ref: InvestigationRef = { name: slot.name, episodeNumber: slot.episodeNumber };
+        await this.lifecycle.jobs.push({ id: `stop:${refLabel(slot)}`, fn: "stop", payload: ref, time: Date.now() });
         continue;
       }
       let running = true; // cannot answer: keep the slot and look again later, until the hard cap
       try {
-        running = await investigationStubByName(this.env, slot.name).stillRunning(slot.episode);
+        running = await investigationStubByName(this.env, slot.name).stillRunning(slot.episodeNumber);
       } catch (error) {
-        console.error(`Coordinator: could not ask Investigation ${slot.name}#${slot.episode} whether it runs`, error);
+        console.error(`Coordinator: could not ask Investigation ${refLabel(slot)} whether it runs`, error);
       }
       const { slots } = await this.#state(); // re-read: other requests may have run meanwhile
       const current = slots.find((s) => same(s, slot));
@@ -208,9 +211,9 @@ export class Coordinator extends DurableObject<Env> {
       if (running) {
         const leaseUntil = Math.min(ports().now() + LEASE_EXTENSION_MS, hardCap);
         await this.#putSlots(slots.map((s) => (same(s, slot) ? { ...s, leaseUntil } : s)));
-        console.log(JSON.stringify({ event: "coordinator.lease-extended", investigation: slot.name, episode: slot.episode, leaseUntil }));
+        console.log(JSON.stringify({ event: "coordinator.lease-extended", investigation: slot.name, episode: slot.episodeNumber, leaseUntil }));
       } else {
-        console.warn(`Coordinator: reclaimed the run slot of Investigation ${slot.name}#${slot.episode}, which never released it`);
+        console.warn(`Coordinator: reclaimed the run slot of Investigation ${refLabel(slot)}, which never released it`);
         await this.#putSlots(slots.filter((s) => !same(s, slot)));
       }
     }
@@ -230,7 +233,7 @@ export class Coordinator extends DurableObject<Env> {
 
   /** The Investigation time limit from config. */
   #timeLimitMs(): number {
-    return ports().config(this.env).budgets.investigationMinutes * 60_000;
+    return timeLimitMs(ports().config(this.env).budgets.investigationMinutes);
   }
 
   #maxConcurrent(): number {

@@ -1,5 +1,6 @@
 import type { DurableObjectStorageLike, Workspace } from "@cloudflare/computer";
 import type { CreatePiToolsOptions } from "@cloudflare/computer/tools/pi-ai";
+import { isFullSha } from "../github";
 import type { CheckoutInput, CodeWorkspace, FileChange } from "./code-workspace";
 import { WORKSPACE_ROOT, workspaceTools } from "./tools";
 
@@ -17,7 +18,7 @@ export class ComputerWorkspace implements CodeWorkspace {
   constructor(private readonly ctx: DurableObjectState) {}
 
   async checkout({ owner, repo, sha, token }: CheckoutInput): Promise<void> {
-    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`the deployed commit ${sha} is not a full commit SHA`);
+    if (!isFullSha(sha)) throw new Error(`the deployed commit ${sha} is not a full commit SHA`);
     if ((await this.#head()) === sha && (await this.changes()).length === 0) return;
     const ws = await this.#open();
     await ws.fs.rm(WORKSPACE_ROOT, { recursive: true, force: true });

@@ -199,6 +199,16 @@ const ConfigSchema = z
 export type OncallConfig = z.infer<typeof ConfigSchema>;
 export type Org = OncallConfig["orgs"][number];
 
+/** The per-Investigation time limit (`budgets.investigationMinutes`) in milliseconds. */
+export function timeLimitMs(minutes: number): number {
+  return minutes * 60_000;
+}
+
+/** Whether an Investigation that started running at `startedAt` is past its time limit at `now` (business clock). */
+export function pastTimeLimit(startedAt: number, minutes: number, now: number): boolean {
+  return now - startedAt >= timeLimitMs(minutes);
+}
+
 /** Validates ONCALL_CONFIG. Throws on an invalid config: better to fail loudly than to drop alerts silently. */
 export function parseConfig(raw: unknown): OncallConfig {
   return ConfigSchema.parse(raw);
