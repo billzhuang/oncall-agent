@@ -3,7 +3,7 @@ import { abortAllDurableObjects, listDurableObjectIds, reset, runDurableObjectAl
 import { parseConfig } from "../src/config";
 import { resetPorts, setPorts } from "../src/ports";
 import { fakeClock } from "./fakes/clock";
-import { fakeDatadogMcp } from "./fakes/datadog-mcp";
+import { defaultDatadogTools, fakeDatadogMcp } from "./fakes/datadog-mcp";
 import { fakeGitHub } from "./fakes/github";
 import { scriptedModel } from "./fakes/model";
 import { router } from "./fakes/router";
@@ -19,7 +19,9 @@ export function installFakes(opts: { config?: Record<string, unknown>; now?: num
   const teams = fakeTeams();
   const github = fakeGitHub();
   const datadog = fakeDatadogMcp();
-  const model = scriptedModel(MODEL_ID);
+  const model = scriptedModel(String(opts.config?.modelId ?? MODEL_ID));
+  datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, defaultDatadogTools("gap"));
+  datadog.org(TEST_SECRETS.WK_DATADOG_TOKEN, defaultDatadogTools("wk"));
   const network = router({ "teams.test": teams, "api.github.com": github, "mcp.datadoghq.eu": datadog });
   setPorts({
     now: clock.now,
@@ -102,6 +104,19 @@ export async function sendWebhook(
 function orgOf(body: unknown): keyof typeof ORG_SECRETS {
   const orgId = (body as { orgId?: string } | null)?.orgId;
   return orgId === WK_ORG_ID ? "wk" : "gap";
+}
+
+/** The Investigation Durable Object of an Alert episode, as a fresh stub (e.g. after eviction). */
+export function investigationOf(payload: { orgId: string; monitorId: string; group: string }) {
+  const org = payload.orgId === WK_ORG_ID ? "wk" : "gap";
+  return env.INVESTIGATION.getByName(`${org}:${payload.monitorId}:${payload.group}`);
+}
+
+/** A promise the test resolves later, e.g. to hold a Datadog tool call open. */
+export function gate() {
+  let open!: () => void;
+  const opened = new Promise<void>((resolve) => (open = resolve));
+  return { opened, open };
 }
 
 /**

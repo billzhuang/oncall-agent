@@ -8,7 +8,7 @@ beforeEach(() => {
 afterEach(cleanUp);
 
 describe("Alert to Teams", () => {
-  it("posts a placeholder Investigation report to the Owning team's channel when an Opted-in monitor triggers", async () => {
+  it("posts an Investigation report to the Owning team's channel when an Opted-in monitor triggers", async () => {
     const alert = alertPayload({ tags: ["oncall-agent:enabled", "team:sre"], title: "[Triggered] High error rate on checkout" });
 
     const res = await sendWebhook(alert);
@@ -21,16 +21,6 @@ describe("Alert to Teams", () => {
     expect(post.text).toContain("High error rate on checkout");
     expect(post.text).toContain(alert.link);
     expect(post.text).toContain("gap");
-  });
-
-  it("builds the placeholder report from the alert alone, without calling the model", async () => {
-    fakes.clock.set(Date.UTC(2026, 6, 4, 8, 30));
-
-    await sendWebhook(alertPayload());
-
-    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
-    expect(fakes.teams.posts[0].text).toContain("2026-07-04T08:30:00.000Z");
-    expect(fakes.model.faux.state.callCount).toBe(0);
   });
 
   it("links the monitor on the Org's Datadog site, never a link the webhook supplied elsewhere", async () => {

@@ -24,6 +24,39 @@ const OrgSchema = z.object({
   defaultTeamsSecret: SecretName,
 });
 
+/**
+ * Datadog MCP tools the agent may use: read-only tools only. Datadog's own MCP write access is disabled for the
+ * Orgs' service accounts too; this allowlist is the agent-side guarantee. A tool the server marks as not
+ * read-only is never exposed, even when listed here.
+ */
+export const DEFAULT_DATADOG_TOOLS = [
+  "search_datadog_logs",
+  "analyze_datadog_logs",
+  "search_datadog_spans",
+  "aggregate_spans",
+  "get_datadog_trace",
+  "search_datadog_metrics",
+  "get_datadog_metric",
+  "get_datadog_metric_context",
+  "search_datadog_monitors",
+  "search_datadog_events",
+  "aggregate_events",
+  "search_datadog_incidents",
+  "get_datadog_incident",
+  "search_datadog_dashboards",
+  "get_datadog_dashboard",
+  "search_datadog_hosts",
+  "search_datadog_entities",
+  "search_datadog_rum_events",
+  "aggregate_rum_events",
+  "get_change_stories",
+  "search_datadog_error_tracking_issues",
+  "get_datadog_error_tracking_issue",
+  "analyze_datadog_error_tracking_errors",
+  "search_watchdog_stories",
+  "get_watchdog_story",
+];
+
 const ConfigSchema = z
   .object({
     orgs: z.array(OrgSchema).min(1),
@@ -38,6 +71,12 @@ const ConfigSchema = z
       .prefault({}),
     /** Workers AI model ID. */
     modelId: z.string().min(1).default("@cf/deepseek-ai/deepseek-v4.1-flash-1017"),
+    datadog: z
+      .object({
+        /** Allowlist of read-only Datadog MCP tool names offered to the agent. */
+        tools: z.array(z.string().min(1)).default(DEFAULT_DATADOG_TOOLS),
+      })
+      .prefault({}),
     budgets: z
       .object({
         investigationUsd: z.number().positive().default(3),
