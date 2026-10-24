@@ -37,3 +37,32 @@ describe("Cost cap", () => {
     expect(fakes.model.requests).toHaveLength(requests);
   });
 });
+
+describe("30-minute limit", () => {
+  it("ends an Investigation that runs past 30 minutes as Partial, with the evidence so far and the reason", async () => {
+    fakes = installFakes();
+    fakes.datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, [
+      {
+        name: "search_datadog_logs",
+        result: () => {
+          fakes.clock.advance(minutes(11)); // each query takes eleven minutes of business time
+          return { logs: ["connection pool exhausted in checkout-db"] };
+        },
+      },
+    ]);
+    fakes.model.script(keepsSearching);
+
+    await sendWebhook(alertPayload());
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1), { timeout: 10_000 });
+    const [post] = fakes.teams.posts;
+    expect(post.text).toMatch(/partial/i);
+    expect(post.text).toMatch(/30 minutes/);
+    expect(post.text).toContain("connection pool exhausted in checkout-db");
+    expect(post.text).toContain("33m 0s");
+    expect(fakes.datadog.calls).toHaveLength(3);
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.datadog.calls).toHaveLength(3);
+  });
+});
