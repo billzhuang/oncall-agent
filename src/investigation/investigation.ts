@@ -161,7 +161,7 @@ export class Investigation extends DurableObject<Env> {
    * Call from an RPC or `onAlarm`, or un-awaited from a hook: abort waits for the run to go idle.
    */
   private async interrupt(reason: Interruption): Promise<void> {
-    if (!(await this.#flagInterruption(reason))) return;
+    if ((await this.#flagInterruption(reason)) === "not-running") return;
     await this.harness.abort();
     await this.#scheduleFinalize();
   }
@@ -171,19 +171,20 @@ export class Investigation extends DurableObject<Env> {
    * waits for the run to go idle. `#finalize` re-aborts if an eviction came between the flag and the abort.
    */
   async #interruptFromRun(reason: Interruption): Promise<void> {
-    if (!(await this.#flagInterruption(reason))) return;
+    if ((await this.#flagInterruption(reason)) !== "flagged") return; // one abort per run, not one per hook call
     void this.harness
       .abort()
       .then(() => this.#scheduleFinalize())
       .catch((error) => console.error(`Investigation ${this.lifecycle.name}: abort failed`, error));
   }
 
-  /** Records why the run is interrupted (the first reason wins); false when no Investigation is running. */
-  async #flagInterruption(reason: Interruption): Promise<boolean> {
+  /** Records why the run is interrupted; the first reason wins. */
+  async #flagInterruption(reason: Interruption): Promise<"flagged" | "already-flagged" | "not-running"> {
     const episode = await this.#episode();
-    if (!episode || finished(episode.status)) return false;
-    if (!(await this.ctx.storage.get(interruptedKey(episode)))) await this.ctx.storage.put(interruptedKey(episode), reason);
-    return true;
+    if (!episode || finished(episode.status)) return "not-running";
+    if (await this.ctx.storage.get(interruptedKey(episode))) return "already-flagged";
+    await this.ctx.storage.put(interruptedKey(episode), reason);
+    return "flagged";
   }
 
   /** Opens an Alert episode and starts its Investigation. */
@@ -476,7 +477,7 @@ export class Investigation extends DurableObject<Env> {
         const { budgets } = ports().config(this.env);
         return {
           startedAt: episode.startedAt ?? episode.openedAt,
-          costBaselineUsd: (await storage.get<number>(costBaselineKey(episode))) ?? 0,
+          spentUsd: (await this.#record(episode)).costUsd,
           maxUsd: budgets.investigationUsd,
           maxMinutes: budgets.investigationMinutes,
         };

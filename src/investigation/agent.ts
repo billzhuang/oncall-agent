@@ -1,12 +1,9 @@
 import { createModels } from "@earendil-works/pi-ai/models";
-import type { Context } from "@earendil-works/chord";
 import {
   GenerationTask,
   Harness,
   hook,
   ToolTask,
-  UsageDoc,
-  type HookApi,
   type HookRegistration,
   type Registry,
   type ToolRegistration,
@@ -46,8 +43,8 @@ export interface AgentHost {
 export interface Guardrails {
   /** Business time (`ports().now()`) the Investigation started running. */
   startedAt: number;
-  /** pi's session spend when the Investigation started; its own spend is what came after. */
-  costBaselineUsd: number;
+  /** The Investigation's own model spend so far: pi's session spend minus what was spent before it started. */
+  spentUsd: number;
   maxUsd: number;
   maxMinutes: number;
 }
@@ -99,17 +96,12 @@ function submitReportTool(host: AgentHost): ToolRegistration<typeof ReportSchema
  */
 function agentHooks(host: AgentHost): HookRegistration[] {
   /** Interrupts the run when the Investigation is over its cost cap or time limit; returns the reason. */
-  const enforceGuardrails = async (api: HookApi, context: Context): Promise<string | undefined> => {
+  const enforceGuardrails = async (): Promise<string | undefined> => {
     const limits = await host.guardrails();
     if (!limits) return undefined;
-    const usage = await api.snapshot(UsageDoc, api.conversationId, context);
-    const spent =
-      Object.values(usage?.models ?? {}).reduce((sum, u) => sum + u.cost.total, 0) +
-      Object.values(usage?.tools ?? {}).reduce((sum, u) => sum + u.cost.total, 0) -
-      limits.costBaselineUsd;
     let reason: string | undefined;
-    if (spent >= limits.maxUsd) {
-      reason = `cost cap of $${limits.maxUsd.toFixed(2)} reached ($${spent.toFixed(2)} spent)`;
+    if (limits.spentUsd >= limits.maxUsd) {
+      reason = `cost cap of $${limits.maxUsd.toFixed(2)} reached ($${limits.spentUsd.toFixed(2)} spent)`;
     } else if (ports().now() - limits.startedAt >= limits.maxMinutes * 60_000) {
       reason = `time limit of ${limits.maxMinutes} minutes reached`;
     }
@@ -118,8 +110,8 @@ function agentHooks(host: AgentHost): HookRegistration[] {
   };
   return [
     hook(GenerationTask, {
-      afterResponse: async (_message, api, context) => {
-        await enforceGuardrails(api, context);
+      afterResponse: async () => {
+        await enforceGuardrails();
       },
       // A text answer would end the run without a report: tell the agent once to submit it.
       onYield: async () => {
@@ -128,8 +120,8 @@ function agentHooks(host: AgentHost): HookRegistration[] {
       },
     }),
     hook(ToolTask, {
-      beforeTool: async (_call, api, context) => {
-        const reason = await enforceGuardrails(api, context);
+      beforeTool: async () => {
+        const reason = await enforceGuardrails();
         return reason ? { block: `The Investigation was stopped: ${reason}.` } : undefined;
       },
       afterTool: async (call, result) => {
