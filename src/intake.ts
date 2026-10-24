@@ -1,10 +1,29 @@
 import { z } from "zod";
-import { orgByDatadogId } from "./config";
+import { orgByDatadogId, secret, type Org } from "./config";
 import { investigationStub } from "./durable";
 import { ports } from "./ports";
 
 /** The one HTTP endpoint every Org's Datadog webhook posts to. */
 export const WEBHOOK_PATH = "/webhook/datadog";
+/** Custom header carrying the per-Org webhook secret (set in the Org's Datadog webhook configuration). */
+export const SECRET_HEADER = "x-oncall-agent-secret";
+/** The tag that makes a monitor an Opted-in monitor. */
+export const OPT_IN_TAG = "oncall-agent:enabled";
+
+export const TRANSITIONS = ["Triggered", "Recovered", "Warn", "No Data"] as const;
+export type Transition = (typeof TRANSITIONS)[number];
+
+/**
+ * Datadog's $ALERT_TRANSITION, case-insensitive. A leading "Re-" (Re-Triggered, Re-Warn: renotifications)
+ * maps to the base transition, so a re-trigger joins its open Alert episode.
+ */
+function normalizeTransition(raw: unknown): unknown {
+  if (typeof raw !== "string") return raw;
+  const base = raw.trim().toLowerCase().replace(/^re-/, "").replace(/[\s_]+/g, " ");
+  return TRANSITIONS.find((t) => t.toLowerCase() === base) ?? raw;
+}
+
+const Id = z.union([z.string(), z.number()]).transform(String);
 
 /**
  * The fixed JSON contract each Org's Datadog webhook is configured to send (Datadog template variables):
@@ -16,21 +35,20 @@ export const WEBHOOK_PATH = "/webhook/datadog";
  * identifies a delivery. `tags` may arrive as an array or a comma-separated string.
  */
 const PayloadSchema = z.object({
-  orgId: z.union([z.string(), z.number()]).transform(String),
-  alertId: z.union([z.string(), z.number()]).transform(String).pipe(z.string().min(1)),
-  transition: z.string(),
-  monitorId: z.union([z.string(), z.number()]).transform(String).pipe(z.string().min(1)),
-  group: z.string().default(""),
+  orgId: Id,
+  alertId: Id.pipe(z.string().min(1).max(256)),
+  transition: z.preprocess(normalizeTransition, z.enum(TRANSITIONS)),
+  /** Datadog monitor IDs are numeric. */
+  monitorId: Id.pipe(z.string().regex(/^\d{1,20}$/)),
+  group: z.string().max(1024).default(""),
   tags: z
     .union([z.array(z.string()), z.string()])
     .default([])
     .transform((t) => (Array.isArray(t) ? t : t.split(",")).map((s) => s.trim()).filter(Boolean)),
   link: z.string().default(""),
-  title: z.string().default(""),
-  date: z.union([z.string(), z.number()]).transform(String).default(""),
+  title: z.string().max(1024).default(""),
+  date: Id.default(""),
 });
-
-export type Transition = "Triggered" | "Recovered" | "Warn" | "No Data";
 
 /** The identity of an Alert episode: Org, monitor and group. */
 export interface AlertEpisodeKey {
@@ -39,11 +57,12 @@ export interface AlertEpisodeKey {
   group: string;
 }
 
-/** A validated alert notification from an Opted-in monitor. */
+/** A validated, authenticated alert notification from an Opted-in monitor. */
 export interface Alert extends AlertEpisodeKey {
   alertId: string;
   transition: Transition;
   tags: string[];
+  /** Monitor link on the Org's Datadog site (never an arbitrary URL from the payload). */
   link: string;
   title: string;
   date: string;
@@ -60,23 +79,58 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   if (!parsed.success) return reply(400, "payload does not match the webhook contract");
   const payload = parsed.data;
 
+  // Authenticate before anything touches state: a rejected webhook must have no effect.
   const config = ports().config(env);
   const org = orgByDatadogId(config, payload.orgId);
-  if (!org) return reply(401, "unauthorized");
+  const expected = org ? secret(env, org.webhookSecret) : undefined;
+  if (!org || !expected || !(await sameSecret(request.headers.get(SECRET_HEADER), expected))) {
+    return reply(401, "unauthorized"); // same answer for unknown Org, unset secret and wrong secret
+  }
+
+  // Ignored notifications still answer 2xx, or Datadog would retry them. None of them touches a Durable Object.
+  if (!payload.tags.includes(OPT_IN_TAG)) return reply(202, "ignored: not an Opted-in monitor");
+  // Only Triggered starts an Investigation. Recovered is ignored until #3 routes it to the Investigation.
+  if (payload.transition !== "Triggered") return reply(202, `ignored: ${payload.transition} transition`);
 
   const alert: Alert = {
     org: org.name,
     monitorId: payload.monitorId,
     group: payload.group,
     alertId: payload.alertId,
-    transition: payload.transition as Transition,
+    transition: payload.transition,
     tags: payload.tags,
-    link: payload.link,
+    link: monitorLink(org, payload.monitorId, payload.link),
     title: payload.title,
     date: payload.date,
   };
   const outcome = await investigationStub(env, alert).triggered(alert);
   return reply(202, outcome);
+}
+
+/**
+ * The monitor link for messages: the webhook's link only when it is https on the Org's Datadog app host
+ * (it may carry useful group/time parameters), else built from the monitor ID. Payload text is untrusted.
+ */
+function monitorLink(org: Org, monitorId: string, supplied: string): string {
+  const host = `app.${org.site}`;
+  try {
+    const url = new URL(supplied);
+    if (url.protocol === "https:" && url.host === host && !url.username && !url.password) return url.toString();
+  } catch {
+    // not a URL: fall through
+  }
+  return `https://${host}/monitors/${monitorId}`;
+}
+
+/** Constant-time comparison of the presented secret with the expected one (digests have equal length). */
+async function sameSecret(presented: string | null, expected: string): Promise<boolean> {
+  if (presented === null) return false;
+  const encoder = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(presented)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  return crypto.subtle.timingSafeEqual(a, b);
 }
 
 function reply(status: number, outcome: string): Response {
