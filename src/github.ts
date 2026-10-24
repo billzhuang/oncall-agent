@@ -16,6 +16,9 @@ export interface RepoRef {
 
 export const repoName = (repo: RepoRef): string => `${repo.owner}/${repo.name}`;
 
+/** Whether `sha` is a full 40-hex commit SHA, the only form a clone can be pinned to. */
+export const isFullSha = (sha: string): boolean => /^[0-9a-f]{40}$/.test(sha);
+
 /**
  * The GitHub repo a source code integration `git.repository_url` names, in any of the forms Datadog stores:
  * `github.com/o/r`, `https://github.com/o/r(.git)`, `git@github.com:o/r.git`, `ssh://git@github.com/o/r`.
@@ -137,7 +140,8 @@ export class RepoClient {
 
   /**
    * Points an `oncall-agent/*` branch at `sha`: creates it, or moves it (force) when it exists. Idempotent: a
-   * branch already at `sha` is left alone. Refuses any other branch.
+   * branch already at `sha` is left alone. Refuses any other branch. The caller first checks that the branch holds
+   * only the harness's own commit (see `pushAgentPr`), so nothing a Code owner pushed is ever forced over.
    */
   async pushAgentBranch(branch: string, sha: string): Promise<void> {
     if (!branch.startsWith(AGENT_BRANCH_PREFIX) || branch.includes("..")) {
@@ -151,6 +155,23 @@ export class RepoClient {
       // 422: created meanwhile (a replayed step); move it instead.
     }
     await this.#call("PATCH", `git/refs/heads/${branch}`, { sha, force: true });
+  }
+
+  /** The commit a branch points at, or undefined when there is no such branch. */
+  async branchSha(branch: string): Promise<string | undefined> {
+    const ref = await this.#call<{ object: { sha: string } } | undefined>("GET", `git/ref/heads/${branch}`, undefined, [404]);
+    return ref?.object.sha;
+  }
+
+  /** Bodies of the comments on a pull request (first page: the harness comments at most once per Alert episode). */
+  async pullComments(number: number): Promise<string[]> {
+    const comments = await this.#call<Array<{ body?: string }>>("GET", `issues/${number}/comments?per_page=100`);
+    return comments.map((c) => c.body ?? "");
+  }
+
+  /** Comments on a pull request. */
+  async commentOnPull(number: number, body: string): Promise<void> {
+    await this.#call("POST", `issues/${number}/comments`, { body });
   }
 
   /** The open pull request from `branch`, if any. */

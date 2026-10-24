@@ -1,6 +1,6 @@
 import { orgByName, type OncallConfig } from "./config";
 import type { DatadogConnection } from "./datadog-mcp";
-import { appInstallationFor, githubRepoFromUrl, repoName } from "./github";
+import { appInstallationFor, githubRepoFromUrl, repoName, type RepoRef } from "./github";
 import type { Alert } from "./intake";
 import type { TeamsMessage } from "./teams";
 
@@ -11,7 +11,7 @@ import type { TeamsMessage } from "./teams";
  */
 export type RepoResolution =
   /** The repo and the deployed commit, in a repo the GitHub App is installed on. */
-  | { outcome: "resolved"; service: string; repo: string; repoUrl: string; sha: string; installationId?: number }
+  | { outcome: "resolved"; service: string; repo: RepoRef; repoUrl: string; sha: string; installationId?: number }
   /**
    * Unmapped service: no git tags (or no service tag to look them up by). `reason` is set when tags exist but
    * cannot be trusted to name one repo and commit (the service's spans disagree).
@@ -81,7 +81,7 @@ export async function resolveRepo(
     return { outcome: "not-enabled", service, repo: repoName(repo), why: "not-installed", sha: tags.sha };
   }
   const repoUrl = `https://github.com/${repoName(repo)}`;
-  return { outcome: "resolved", service, repo: repoName(repo), repoUrl, sha: tags.sha, installationId };
+  return { outcome: "resolved", service, repo, repoUrl, sha: tags.sha, installationId };
 }
 
 interface GitTags {
@@ -191,7 +191,7 @@ const message = (error: unknown) => cut(error instanceof Error ? error.message :
 export function codeLine(org: string, resolution: RepoResolution): string {
   switch (resolution.outcome) {
     case "resolved":
-      return `Code: ${resolution.repo} at deployed commit ${resolution.sha}.`;
+      return `Code: ${repoName(resolution.repo)} at deployed commit ${resolution.sha}.`;
     case "unmapped":
       return `Code: Unmapped service: ${unmappedWhy(resolution)}, so its code was not read and no Agent PR can be opened.`;
     case "not-enabled":

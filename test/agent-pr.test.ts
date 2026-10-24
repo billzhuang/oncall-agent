@@ -134,7 +134,7 @@ function outsideCode(markdown: string): string {
 
 /** Teams text with escapes and dot defanging read past. */
 const shown = (text: string) => text.replace(/\\(.)/g, "$1").replace(/\[\.\]/g, ".");
-const writeTokens = () => fakes.github.tokens.filter((t) => t.permissions.contents === "write" || t.permissions.pull_requests);
+const writeTokens = () => fakes.github.tokens.filter((t) => t.permissions.contents === "write" || t.permissions.pull_requests === "write");
 
 describe("Agent PR", () => {
   it("opens one draft PR from main on an oncall-agent/ branch with the agent's edits; the report links it", async () => {
@@ -228,7 +228,7 @@ describe("Agent PR", () => {
     expect(reports()[0]!.text).toContain("Report-only mode");
   });
 
-  it("warns of drift when a file the agent changed also changed on main since the deployed commit", async () => {
+  it("opens no PR when a file the agent changed also changed on main since the deployed commit; the report lists it", async () => {
     const onMain = CHECKOUT.replace("const total = cart.total;", "const total = cart.total ?? 0;");
     const { service, repo } = deployedService({ main: { ...FILES, "src/checkout.ts": onMain, "README.md": "# checkout v2\n" } });
     fakes.model.script(fixScript());
@@ -236,11 +236,15 @@ describe("Agent PR", () => {
     await sendWebhook(alertFor(service));
 
     await waitFor(() => expect(reports()).toHaveLength(1));
-    const [pr] = fakes.github.pulls(repo);
-    expect(pr!.body).toMatch(/drift/i);
-    expect(pr!.body).toContain("src/checkout.ts");
-    expect(pr!.body).not.toContain("README.md"); // changed on main, but not by the agent
-    expect(reports()[0]!.text).toContain("changed on main since the deployed commit");
+    await settle();
+    // The edit was made on the deployed version: pushed onto main it would silently undo main's change.
+    expect(fakes.github.pulls(repo)).toEqual([]);
+    expect(fakes.github.refWrites).toEqual([]);
+    expect(fakes.github.calls.filter((c) => c.method !== "GET" && !c.path.endsWith("/access_tokens"))).toEqual([]); // nothing written
+    const report = shown(reports()[0]!.text);
+    expect(report).toContain("changed on main since the deployed commit");
+    expect(report).toContain("src/checkout.ts");
+    expect(report).not.toContain("README.md"); // changed on main, but not by the agent
   });
 
   it("gives no drift warning when main changed only files the agent did not touch", async () => {
@@ -292,6 +296,59 @@ describe("Agent PR", () => {
     });
     expect(reports()[1]!.text).toContain(`https://github.com/${repo}/pull/${pr!.number}`);
     expect(reports()[1]!.text).toContain("updated");
+  });
+
+  it("never pushes over commits a Code owner added to the Agent PR branch: it comments on the PR instead", async () => {
+    const { service, repo } = deployedService();
+    const second = fixScript({ edits: [["write", { path: "src/guard.ts", content: "export const guard = 1;\n" }]] });
+    fakes.model.script((t) => (t.alert.includes("second episode") ? second(t) : fixScript()(t)));
+    const opened = alertFor(service);
+    await sendWebhook(opened);
+    await waitFor(() => expect(reports()).toHaveLength(1));
+    const [pr] = fakes.github.pulls(repo);
+    const humanHead = fakes.github.pushHumanCommit(repo, pr!.head, { "src/checkout.ts": `${FIXED}// reviewed\n` });
+    const writesBefore = fakes.github.refWrites.length;
+
+    await sendWebhook({ ...opened, alertId: `${opened.alertId}-r`, transition: "Recovered" });
+    await sendWebhook({ ...opened, alertId: `${opened.alertId}-2`, title: "[Triggered] second episode of checkout errors" });
+
+    await waitFor(() => expect(reports()).toHaveLength(2));
+    await settle();
+    expect(fakes.github.refWrites).toHaveLength(writesBefore);
+    expect(fakes.github.commit(repo, pr!.head)!.sha).toBe(humanHead);
+    expect(fakes.github.pulls(repo)).toHaveLength(1);
+    const { comments } = fakes.github.pulls(repo)[0]!;
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("new Alert episode");
+    expect(comments[0]).toContain("not pushed");
+    const report = shown(reports()[1]!.text);
+    expect(report).toContain("commits not made by the oncall agent");
+    expect(report).toContain(`https://github.com/${repo}/pull/${pr!.number}`);
+  });
+
+  it("links the open Agent PR of the monitor group from a later Alert episode without a fix, until it is closed", async () => {
+    const { service, repo } = deployedService();
+    fakes.model.script((t) => (t.alert.includes("later episode") ? fixScript({ fixProposed: false, edits: [] })(t) : fixScript()(t)));
+    const opened = alertFor(service);
+    const episode = (n: number) => ({ ...opened, alertId: `${opened.alertId}-${n}`, title: "[Triggered] later episode" });
+    const recovered = (n: number) => ({ ...opened, alertId: `${opened.alertId}-r${n}`, transition: "Recovered" });
+    await sendWebhook(opened);
+    await waitFor(() => expect(reports()).toHaveLength(1));
+    const [pr] = fakes.github.pulls(repo);
+
+    await sendWebhook(recovered(1));
+    await sendWebhook(episode(2));
+    await waitFor(() => expect(reports()).toHaveLength(2));
+    expect(reports()[1]!.text).toContain(`https://github.com/${repo}/pull/${pr!.number}`);
+    expect(shown(reports()[1]!.text)).toContain("earlier Alert episode");
+
+    fakes.github.closePull(repo, pr!.number);
+    await settle();
+    await sendWebhook(recovered(2));
+    await sendWebhook(episode(3));
+    await waitFor(() => expect(reports()).toHaveLength(3));
+    expect(reports()[2]!.text).not.toContain("/pull/");
+    expect(writeTokens()).toHaveLength(1); // only the first episode pushed
   });
 
   it.each([

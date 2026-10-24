@@ -37,6 +37,8 @@ export interface Pull {
   base: string;
   draft: boolean;
   state: "open" | "closed";
+  /** Bodies of the comments on the pull request, in order. */
+  comments: string[];
 }
 
 interface RepoState {
@@ -239,6 +241,7 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
         base: body.base,
         draft: body.draft === true,
         state: "open",
+        comments: [],
       };
       repo.pulls.push(pull);
       return Response.json(pullJson(full, pull), { status: 201 });
@@ -250,6 +253,15 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
       if (typeof body.body === "string") pull.body = body.body;
       if (body.state === "open" || body.state === "closed") pull.state = body.state;
       return Response.json(pullJson(full, pull));
+    }
+    if ((m = route.match(/^issues\/(\d+)\/comments$/))) {
+      const pull = repo.pulls.find((p) => p.number === Number(m![1]));
+      if (!pull) return notFound();
+      if (method === "GET") return Response.json(pull.comments.map((c, i) => ({ id: i + 1, body: c })));
+      if (method === "POST") {
+        pull.comments.push(String(body.body));
+        return Response.json({ id: pull.comments.length, body: body.body }, { status: 201 });
+      }
     }
     if (method === "GET" && (m = route.match(/^compare\/(.+)\.\.\.(.+)$/))) {
       const base = resolve(repo, m[1]!);
@@ -315,7 +327,8 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
       const repo = rest && repos.get(`${rest[1]}/${rest[2]}`.toLowerCase());
       if (rest && repo) {
         const [, owner, name, route] = rest as unknown as [string, string, string, string];
-        const scope = route.startsWith("pulls") ? "pull_requests" : "contents";
+        // Comments on a pull request go through the issues API and need pull_requests access.
+        const scope = route.startsWith("pulls") || route.startsWith("issues") ? "pull_requests" : "contents";
         const level = request.method === "GET" ? "read" : "write";
         const problem = tokenProblem(request.headers.get("authorization"), name, scope, level);
         if (problem) {
@@ -368,6 +381,20 @@ export function fakeGitHub(opts: { appId: string } = { appId: "123456" }) {
       const sha = nextSha();
       addCommit(repo, sha, files, [repo.refs.get("heads/main")!], "main moved on");
       repo.refs.set("heads/main", sha);
+    },
+    /** A Code owner pushes a commit with these files (merged over the branch's) on top of a branch. */
+    pushHumanCommit(full: string, branch: string, files: Record<string, string>): string {
+      const repo = repos.get(full.toLowerCase())!;
+      const parent = repo.refs.get(`heads/${branch}`)!;
+      const sha = nextSha();
+      addCommit(repo, sha, { ...filesOf(repo, parent), ...files }, [parent], "a Code owner's follow-up");
+      repo.refs.set(`heads/${branch}`, sha);
+      return sha;
+    },
+    /** A Code owner closes a pull request. */
+    closePull(full: string, number: number) {
+      const pull = repos.get(full.toLowerCase())!.pulls.find((p) => p.number === number)!;
+      pull.state = "closed";
     },
     /** The files at a branch (`main`, `oncall-agent/…`) or commit of a repo; undefined when there is none. */
     files(full: string, refOrSha: string): Record<string, string> | undefined {

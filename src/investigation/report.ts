@@ -51,6 +51,7 @@ export function reportMessage(
   record: InvestigationRecord,
   code?: string,
   agentPr?: AgentPrRecord,
+  earlierPr?: EarlierAgentPr,
 ): TeamsMessage {
   const pr = agentPr && agentPrLine(agentPr);
   return {
@@ -62,15 +63,42 @@ export function reportMessage(
       `Suspected cause: ${report.suspectedCause}`,
       ...(code ? [code] : []),
       ...(pr ? [pr] : []),
+      ...(earlierPr ? [earlierPrLine(earlierPr)] : []),
     ],
     facts: episodeFacts(alert),
     measures: recordFacts(record),
-    links: [
-      ...monitorLinks(alert),
-      ...(agentPr?.outcome === "opened" || agentPr?.outcome === "updated" ? [{ title: "Open Agent PR", url: agentPr.url }] : []),
-    ],
+    links: [...monitorLinks(alert), ...agentPrLinks(agentPr, earlierPr)],
   };
 }
+
+/** The open Agent PR an earlier Alert episode of the monitor group opened, linked when this one opened none. */
+export interface EarlierAgentPr {
+  number: number;
+  url: string;
+  branch: string;
+}
+
+function earlierPrLine(pr: EarlierAgentPr): string {
+  return `Agent PR: the open Agent PR #${pr.number} from an earlier Alert episode of this monitor, on branch ${pr.branch}, is still open for Code owners to review.`;
+}
+
+/** The Agent PR link the harness built from GitHub's answer: this episode's PR, else the earlier one still open. */
+function agentPrLinks(agentPr: AgentPrRecord | undefined, earlierPr: EarlierAgentPr | undefined) {
+  const url =
+    agentPr?.outcome === "opened" || agentPr?.outcome === "updated" || agentPr?.outcome === "human-commits"
+      ? agentPr.url
+      : undefined;
+  const link = url ?? earlierPr?.url;
+  return link ? [{ title: "Open Agent PR", url: link }] : [];
+}
+
+/** Whether a record already links an open Agent PR, so no earlier one needs looking up. */
+export function linksAgentPr(agentPr: AgentPrRecord | undefined): boolean {
+  return agentPr?.outcome === "opened" || agentPr?.outcome === "updated" || (agentPr?.outcome === "human-commits" && agentPr.url !== undefined);
+}
+
+/** At most ten paths, for a report line. */
+const pathList = (paths: readonly string[]) => `${paths.slice(0, 10).join(", ")}${paths.length > 10 ? ", …" : ""}`;
 
 /** The report's line about the Agent PR. */
 function agentPrLine(pr: AgentPrRecord): string {
@@ -78,9 +106,17 @@ function agentPrLine(pr: AgentPrRecord): string {
     case "opened":
     case "updated": {
       const what = pr.outcome === "opened" ? "opened draft Agent PR" : "updated the open Agent PR";
-      const drift = pr.drift.length ? " Files it changes also changed on main since the deployed commit: see the PR." : "";
-      return `Agent PR: ${what} #${pr.number} from branch ${pr.branch} for Code owners to review.${drift}`;
+      return `Agent PR: ${what} #${pr.number} from branch ${pr.branch} for Code owners to review.`;
     }
+    case "drifted":
+      return (
+        `Agent PR: none, files the proposed fix changes also changed on main since the deployed commit, so the fix ` +
+        `was not pushed (made on the deployed version, it would undo those changes): ${pathList(pr.paths)}.`
+      );
+    case "human-commits":
+      return pr.number === undefined
+        ? `Agent PR: none, branch ${pr.branch} has commits not made by the oncall agent, so this Alert episode's fix was not pushed over them.`
+        : `Agent PR: not updated, branch ${pr.branch} of the open Agent PR #${pr.number} has commits not made by the oncall agent, so this Alert episode's fix was not pushed over them; the PR has a comment saying so.`;
     case "report-only":
       return "Agent PR: none, Report-only mode is on; the agent's proposed fix was not opened as a PR.";
     case "no-changes":
@@ -89,8 +125,7 @@ function agentPrLine(pr: AgentPrRecord): string {
       const which = pr.allowedPrefixes
         ? `protected paths (CI, build, dependency or ownership files) or paths outside the repo's allowed prefixes (${pr.allowedPrefixes.join(", ")})`
         : "protected paths (CI, build, dependency or ownership files)";
-      const list = `${pr.paths.slice(0, 10).join(", ")}${pr.paths.length > 10 ? ", …" : ""}`;
-      return `Agent PR: none, the proposed fix touches ${which}, which the oncall agent never pushes: ${list}.`;
+      return `Agent PR: none, the proposed fix touches ${which}, which the oncall agent never pushes: ${pathList(pr.paths)}.`;
     }
     case "failed":
       return `Agent PR: could not be opened (${pr.reason}).`;
@@ -105,7 +140,7 @@ function agentPrLine(pr: AgentPrRecord): string {
 export function agentPrBody(
   alert: Alert,
   report: InvestigationReport,
-  input: { deployedSha: string; changedPaths: string[]; drift: string[] },
+  input: { deployedSha: string; changedPaths: string[] },
 ): string {
   const lines = [
     `Draft Agent PR from the oncall agent for an Alert episode of monitor ${alert.monitorId} in Org ${codeSpan(alert.org)}. ` +
@@ -114,17 +149,9 @@ export function agentPrBody(
     `- Monitor: [Open monitor](<${alert.link}>)`,
     `- Owning team: ${codeSpan(owningTeam(alert.tags) ?? "(no team tag)")}`,
     `- Group: ${codeSpan(alert.group || "(none)")}`,
-    `- Deployed commit read: ${codeSpan(input.deployedSha)}; this branch is cut from \`main\`.`,
+    `- Deployed commit read: ${codeSpan(input.deployedSha)}; this branch is cut from \`main\`, where none of the files it changes changed since.`,
     "",
   ];
-  if (input.drift.length) {
-    lines.push(
-      "> [!WARNING]",
-      `> Drift: these files changed on \`main\` since the deployed commit: ${input.drift.map(codeSpan).join(", ")}. ` +
-        "The bug may already be fixed on `main`, and this PR's version of them is based on the deployed commit, so it may undo those changes.",
-      "",
-    );
-  }
   lines.push(
     "### Investigation report",
     "",
@@ -209,6 +236,7 @@ export function partialReportMessage(
   newestEvidenceFirst: readonly string[],
   record: InvestigationRecord,
   code?: string,
+  earlierPr?: EarlierAgentPr,
 ): TeamsMessage {
   const where = alert.group ? `, group ${alert.group}` : "";
   return {
@@ -219,10 +247,11 @@ export function partialReportMessage(
       ...(newestEvidenceFirst.length ? newestEvidenceFirst.map((e) => `• ${e}`) : ["• (none gathered)"]),
       `Suspected cause: cause not determined (stopped: ${reason}). Please check this Alert episode yourself.`,
       ...(code ? [code] : []),
+      ...(earlierPr ? [earlierPrLine(earlierPr)] : []),
     ],
     facts: episodeFacts(alert),
     measures: recordFacts(record),
-    links: monitorLinks(alert),
+    links: [...monitorLinks(alert), ...agentPrLinks(undefined, earlierPr)],
   };
 }
 
