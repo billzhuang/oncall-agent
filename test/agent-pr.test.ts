@@ -300,6 +300,7 @@ describe("Agent PR", () => {
     fakes.model.script(fixScript());
     const loss = fakes.github.loseAnswer(method, path);
     const failed = vi.spyOn(console, "error");
+    failed.mockClear(); // the same spy across test cases: drop calls an earlier case logged
     const alert = alertFor(service);
 
     await sendWebhook(alert);
