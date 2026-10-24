@@ -234,12 +234,17 @@ export class Investigation extends DurableObject<Env> {
     if (!episode || episode.status !== "Running" || episode.startedAt === undefined) return;
     const { budgets } = ports().config(this.env);
     if (ports().now() - episode.startedAt < budgets.investigationMinutes * 60_000) return;
+    if (!(await this.ctx.storage.get(submittedKey(episode)))) {
+      // The agent never got its input: the run job kept failing (e.g. Datadog MCP down). A crash, not a partial.
+      const limit = `it did not start within ${budgets.investigationMinutes} minutes`;
+      return this.#endWithoutReport(episode, await this.#runFailure(limit));
+    }
     await this.#interruptFromRun({ status: "Partial", reason: `time limit of ${budgets.investigationMinutes} minutes reached` });
   }
 
   async onJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
     if (job.fn === "deadline") return this.#checkDeadline();
-    if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run());
+    if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run(), () => this.#runGaveUp());
     if (job.fn === "finalize") return this.#withBackoff(job.id, () => this.#finalize());
     if (job.fn === "open-pending") return this.#withBackoff(job.id, () => this.#openPending());
   }
@@ -322,6 +327,19 @@ export class Investigation extends DurableObject<Env> {
     await this.#finish(episode, "Failed", record, reason);
   }
 
+  /** The run job kept failing: the Investigation could not start its agent, so it ends Failed. */
+  async #runGaveUp(): Promise<void> {
+    const episode = await this.#episode();
+    if (!episode || episode.status !== "Running" || (await this.ctx.storage.get(submittedKey(episode)))) return;
+    await this.#endWithoutReport(episode, await this.#runFailure("it kept failing"));
+  }
+
+  /** Why the agent could not be started, in words for the failed message, with the last error seen. */
+  async #runFailure(what: string): Promise<string> {
+    const error = await this.ctx.storage.get<string>("last-error:run");
+    return `the Investigation could not start its agent: ${what}${error ? ` (last error: ${error.slice(0, 300)})` : ""}`;
+  }
+
   /** Why the agent's run ended without a report, in words for the failed message. */
   async #runEndReason(episode: Episode): Promise<string> {
     try {
@@ -400,17 +418,19 @@ export class Investigation extends DurableObject<Env> {
   async #withBackoff(
     jobId: string,
     work: () => Promise<void | { rescheduleAt: number }>,
+    gaveUp?: () => Promise<void>,
   ): Promise<void | { rescheduleAt: number }> {
     const key = `failures:${jobId}`;
     try {
       const outcome = await work();
-      await this.ctx.storage.delete(key);
+      await this.ctx.storage.delete([key, `last-error:${jobId}`]);
       return outcome;
     } catch (error) {
       const failures = ((await this.ctx.storage.get<number>(key)) ?? 0) + 1;
       await this.ctx.storage.put(key, failures);
+      await this.ctx.storage.put(`last-error:${jobId}`, error instanceof Error ? error.message : String(error));
       console.error(`Investigation ${this.lifecycle.name}: job ${jobId} failed (${failures})`, error);
-      if (failures >= MAX_JOB_FAILURES) return; // give up; #4 reports Failed investigations
+      if (failures >= MAX_JOB_FAILURES) return gaveUp?.();
       return { rescheduleAt: Date.now() + Math.min(1_000 * 2 ** (failures - 1), 5 * 60_000) };
     }
   }

@@ -12,11 +12,19 @@ const minutes = (n: number) => n * 60_000;
 /** An agent that keeps querying Datadog and never submits its report. */
 const keepsSearching: Script = () => toolCall("datadog_search_datadog_logs", { query: "service:checkout status:error" });
 
+/** The structured `investigation.finished` records the Worker logged. */
+function finishedRecords(log: { mock: { calls: unknown[][] } }): Array<Record<string, any>> {
+  return log.mock.calls
+    .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : undefined))
+    .filter((r) => r?.event === "investigation.finished");
+}
+
 /** $ per million tokens at which each model request costs about a dollar or more. */
 const EXPENSIVE = 5_000;
 
 describe("Cost cap", () => {
   it("ends an Investigation that spends more than $3 as Partial, with the evidence so far and the reason", async () => {
+    const log = vi.spyOn(console, "log");
     fakes = installFakes({ costPerMTok: EXPENSIVE });
     fakes.model.script(keepsSearching);
 
@@ -31,6 +39,8 @@ describe("Cost cap", () => {
     expect(post.text).toContain("NullPointerException in CheckoutController[.]placeOrder"); // evidence gathered so far
     expect(post.text).not.toContain("Investigation report:");
     expect(fakes.model.requests.length).toBeLessThan(10);
+    await vi.waitFor(() => expect(finishedRecords(log)).toMatchObject([{ status: "Partial" }]));
+    expect(finishedRecords(log)[0].costUsd).toBeGreaterThanOrEqual(3);
     const requests = fakes.model.requests.length;
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
@@ -99,5 +109,62 @@ describe("30-minute limit", () => {
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
     expect(fakes.datadog.calls).toHaveLength(1);
+  });
+});
+
+describe("Once across replays", () => {
+  it("posts the partial message once when Teams fails at first and the Investigation is evicted", async () => {
+    fakes = installFakes({ costPerMTok: EXPENSIVE });
+    fakes.model.script(keepsSearching);
+    fakes.teams.fail(1);
+    const alert = alertPayload();
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
+
+    await abortAllDurableObjects();
+    await vi.waitFor(
+      async () => {
+        await runDurableObjectAlarm(investigationOf(alert));
+        expect(fakes.teams.posts).toHaveLength(1);
+      },
+      { timeout: 15_000, interval: 250 },
+    );
+    expect(fakes.teams.posts[0].text).toMatch(/cost cap/i);
+    const requests = fakes.model.requests.length;
+
+    await abortAllDurableObjects();
+    await runDurableObjectAlarm(investigationOf(alert));
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.model.requests).toHaveLength(requests);
+  });
+});
+
+describe("Crash", () => {
+  it("ends an Investigation that cannot run because Datadog MCP is down as Failed, with a message", async () => {
+    fakes = installFakes();
+    fakes.datadog.setDown(true);
+    const alert = alertPayload();
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(fakes.datadog.requests.length).toBeGreaterThan(0));
+
+    fakes.clock.advance(minutes(31));
+    await vi.waitFor(
+      async () => {
+        await runDurableObjectAlarm(investigationOf(alert));
+        expect(fakes.teams.posts).toHaveLength(1);
+      },
+      { timeout: 15_000, interval: 200 },
+    );
+
+    const [post] = fakes.teams.posts;
+    expect(post.channel).toBe("sre");
+    expect(post.text).toMatch(/failed/i);
+    expect(post.text).toMatch(/503|unavailable/i);
+    expect(fakes.model.requests).toHaveLength(0);
+    fakes.datadog.setDown(false);
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.model.requests).toHaveLength(0);
   });
 });
