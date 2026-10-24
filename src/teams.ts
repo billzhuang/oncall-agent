@@ -64,12 +64,16 @@ export async function postToTeams(env: Env, channelSecret: string, message: Team
 /** A URL with a scheme (`https://…`, `ftp://…`), or a scheme Teams opens without `//` (`mailto:…`). */
 const SCHEME_URL = /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s<>"']*|\b(?:mailto|tel|sms|sip|callto|skype|msteams|javascript|vbscript|data|file):[^\s<>"']*/gi;
 /**
- * Every dot between alphanumeric labels, so no bare domain survives whatever its TLD (`evil.support`). No TLD
- * allowlist: version numbers and dotted identifiers read `1[.]2[.]3`, an accepted cost.
+ * Every dot between label characters of any script (`evil.support`, `пример.рф`), so no bare domain survives
+ * whatever its TLD. It runs after markdown escaping, so it also matches across an escape backslash (`a\_.b`). No
+ * TLD allowlist: version numbers and dotted identifiers read `1[.]2[.]3`, an accepted cost.
  */
-const LABEL_DOT = /(?<=[a-z0-9-])\.(?=[a-z0-9-])/gi;
-/** Characters a linkifier may read as a dot: ideographic, fullwidth and halfwidth full stops, and other lookalikes. */
-const DOT_LOOKALIKES = /[。．｡․﹒]/g;
+const LABEL_DOT = /(?<=[\p{L}\p{N}\p{M}_-]\\?)\.(?=\\?[\p{L}\p{N}\p{M}_-])/gu;
+/**
+ * Characters a linkifier or IDNA may read as a dot, left after NFKC folding (which already maps the fullwidth,
+ * small and one-dot-leader forms to `.`): ideographic and halfwidth ideographic full stops, and other lookalikes.
+ */
+const DOT_LOOKALIKES = /[\u3002\uFF0E\uFF61\u2024\uFE52\u2E3C\u0589\u06D4\u0701\u0702\u1362\uA4F8\uA60E]/g;
 
 /** Escapes markdown in one line: emphasis, code, links and images, autolinks/HTML; headings, lists, quotes. */
 function escapeMarkdownLine(line: string): string {
@@ -93,7 +97,8 @@ function defang(text: string): string {
  * line start, and never followed by an unescaped `(`. The only links in a message are the card's own actions, built by the harness from trusted URLs.
  */
 export function plain(text: string): string {
-  return defang(escapeMarkdown(text.replace(DOT_LOOKALIKES, ".")));
+  // NFKC first: fullwidth and other compatibility forms (`ｅｖｉｌ．ｃｏｍ`) become the ASCII a linkifier would see.
+  return defang(escapeMarkdown(text.normalize("NFKC").replace(DOT_LOOKALIKES, ".")));
 }
 
 function escapeMarkdown(text: string): string {

@@ -130,6 +130,28 @@ describe("Teams messages are plain text", () => {
     expect(raw).toContain("evil[.]example");
   });
 
+  it("defangs internationalised and fullwidth hosts: Cyrillic labels, fullwidth letters and dots", async () => {
+    fakes.model.script(
+      investigate({
+        report: () => ({
+          whatFired: "Visit пример.рф or вход.пример.рф now",
+          evidence: ["Fullwidth ｅｖｉｌ．ｃｏｍ and ｌｏｇｉｎ.ｅｘａｍｐｌｅ, mixed раураl.com"],
+          suspectedCause: "unknown",
+        }),
+      }),
+    );
+
+    await sendWebhook(alertPayload());
+
+    await waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    const raw = cardBodyText(fakes.teams.posts[0].body);
+    expect(raw).not.toMatch(/\p{L}\.\p{L}/u); // no dot between two letters, in any script
+    expect(raw).not.toMatch(/[．｡。]/);
+    expect(raw).toContain("пример[.]рф");
+    expect(raw).toContain("evil[.]com"); // fullwidth letters folded to ASCII, then defanged
+    expect(raw).toContain("раураl[.]com");
+  });
+
   it("defangs bare URLs and <url> autolinks in the alert title", async () => {
     const alert = alertPayload({ title: "[Triggered] see https://evil.example/x or <https://evil.example/y> www.evil.example" });
 
