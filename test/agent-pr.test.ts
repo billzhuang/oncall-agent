@@ -15,8 +15,8 @@ import { GITHUB_APP_ID, TEST_SECRETS } from "./config";
 import { toolCall, type Script, type Transcript } from "./fakes/model";
 
 let fakes: Fakes;
-/** Report-only off globally: the setting under which Agent PRs are opened. */
-const PRS_ON = { reportOnly: { global: false, teams: {} } };
+/** Report-only off globally and team sre allowed Agent PRs: the setting under which they are opened. */
+const PRS_ON = { reportOnly: false, agentPrTeams: ["sre"] };
 
 beforeEach(() => {
   fakes = installFakes({ config: PRS_ON });
@@ -210,14 +210,15 @@ describe("Agent PR", () => {
   });
 
   it.each([
-    ["globally", { global: true, teams: {} }],
-    ["for the Owning team", { global: false, teams: { sre: true } }],
-  ])("posts the report but opens no branch and no PR under Report-only mode %s", async (_, reportOnly) => {
-    fakes = installFakes({ config: { reportOnly } });
+    ["is on globally, even for a team allowed Agent PRs", { reportOnly: true, agentPrTeams: ["sre"] }, ["team:sre"]],
+    ["is off globally but the Owning team is not allowed Agent PRs", { reportOnly: false, agentPrTeams: ["payments"] }, ["team:sre"]],
+    ["is off globally but the monitor names no Owning team", { reportOnly: false, agentPrTeams: ["sre"] }, []],
+  ])("posts the report but opens no branch and no PR when Report-only mode %s", async (_, config, teamTags) => {
+    fakes = installFakes({ config });
     const { service, repo } = deployedService();
     fakes.model.script(fixScript());
 
-    await sendWebhook(alertFor(service));
+    await sendWebhook({ ...alertFor(service), tags: ["oncall-agent:enabled", `service:${service}`, ...teamTags] });
 
     await waitFor(() => expect(reports()).toHaveLength(1));
     await settle();
@@ -425,8 +426,8 @@ describe("Agent PR", () => {
     for (const { token } of fakes.github.tokens) expect(reports()[0]!.text).not.toContain(token);
   });
 
-  it("opens Agent PRs for a team whose Report-only switch is off while it stays on globally", async () => {
-    fakes = installFakes({ config: { reportOnly: { global: true, teams: { payments: false } } } });
+  it("opens Agent PRs only for the Owning teams allowed them once Report-only mode is off globally", async () => {
+    fakes = installFakes({ config: { reportOnly: false, agentPrTeams: ["payments"] } });
     const pilot = deployedService();
     const other = deployedService();
     fakes.model.script(fixScript());

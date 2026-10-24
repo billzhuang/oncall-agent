@@ -29,10 +29,13 @@ export type AgentPrRecord =
   /** GitHub refused or kept failing; the report says so. */
   | { outcome: "failed"; reason: string };
 
-/** Whether Report-only mode applies to an alert: the Owning team's switch where config names one, else the global one. */
+/**
+ * Whether Report-only mode applies to an alert: always while the global switch is on; otherwise unless its Owning
+ * team is one allowed Agent PRs. No team tag means Report-only.
+ */
 export function reportOnly(config: OncallConfig, tags: readonly string[]): boolean {
   const team = owningTeam(tags);
-  return (team !== undefined ? config.reportOnly.teams[team] : undefined) ?? config.reportOnly.global;
+  return config.reportOnly || team === undefined || !config.agentPrTeams.includes(team);
 }
 
 /**

@@ -151,13 +151,17 @@ const ConfigSchema = z
       /** Per-repo Agent PR settings, keyed by `owner/name`. */
       repos: z.record(z.string().regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/), RepoSettingsSchema).default({}),
     }),
-    /** Report-only mode: `global`, overridden per Owning team where `teams` names it. */
-    reportOnly: z
-      .object({
-        global: z.boolean().default(true),
-        teams: z.record(z.string().min(1), z.boolean()).default({}),
-      })
-      .prefault({}),
+    /**
+     * Report-only mode, the global kill switch: while true, no Agent PR is opened for anyone. Off, Agent PRs are
+     * opened only for the Owning teams listed in `agentPrTeams`.
+     */
+    reportOnly: z.boolean().default(true),
+    /**
+     * Owning teams (the monitor's `team` tag value) allowed Agent PRs once `reportOnly` is off. Every other team,
+     * including one that opts a monitor in later just by tagging it, and a monitor with no team tag, stays in
+     * Report-only mode.
+     */
+    agentPrTeams: z.array(z.string().min(1)).default([]),
     /** Workers AI model ID. */
     modelId: z.string().min(1).default("@cf/deepseek-ai/deepseek-v4.1-flash-1017"),
     datadog: z

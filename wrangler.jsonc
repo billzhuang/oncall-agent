@@ -27,7 +27,9 @@
       // The GitHub App held by the harness (ADR 0002); its private key is a PKCS#8 PEM Worker secret.
       // appId "0" is a placeholder: until it is set, repo resolution reports "Code: not read" (no reminders).
       "github": { "appId": "0", "privateKeySecret": "GITHUB_APP_PRIVATE_KEY" },
-      "reportOnly": { "global": true, "teams": {} },
+      // Report-only mode is the global kill switch. Agent PRs need it off AND the Owning team listed in agentPrTeams.
+      "reportOnly": true,
+      "agentPrTeams": [],
       "modelId": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
       "budgets": { "investigationUsd": 3, "investigationMinutes": 30, "dailyUsd": 30, "maxConcurrent": 5 }
     }
