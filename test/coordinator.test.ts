@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TEST_SECRETS } from "./config";
-import { investigate, toolCall, type Transcript } from "./fakes/model";
+import { TEST_SECRETS, testConfig } from "./config";
+import { investigate, textOf, toolCall, type ModelRequest, type Transcript } from "./fakes/model";
 import { alertPayload, cleanUp, gate, installFakes, sendWebhook, settle, type Fakes } from "./harness";
 
 let fakes: Fakes;
 afterEach(cleanUp);
+
+const BUDGETS = testConfig().budgets;
+
+/** The alert a model request's Investigation was started with. */
+const alertText = (r: ModelRequest) => textOf(r.messages.find((m) => m.role === "user")?.content);
 
 /** The monitor an Investigation's agent was started on, read from the alert it was given. */
 const monitorOf = (t: Transcript) => /Monitor ID: (\d+)/.exec(t.alert)?.[1] ?? "";
@@ -61,5 +66,105 @@ describe("Concurrency", () => {
     for (const alert of alerts) held.release(alert.monitorId);
     await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(7));
     expect(fakes.teams.posts.every((p) => p.text.startsWith("Investigation report"))).toBe(true);
+  });
+
+  it("takes the concurrency limit from config", async () => {
+    fakes = installFakes({ config: { budgets: { ...BUDGETS, maxConcurrent: 2 } } });
+    const alerts = Array.from({ length: 3 }, () => alertPayload());
+    const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
+    for (const alert of alerts) await sendWebhook(alert);
+
+    await vi.waitFor(() => expect(held.started).toHaveLength(2));
+    await settle();
+    expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]);
+
+    held.release(alerts[1].monitorId);
+    await vi.waitFor(() => expect(held.started).toEqual(alerts.map((a) => a.monitorId)));
+  });
+
+  it("reclaims the run slot of an Investigation that never finishes, once its time limit has long passed", async () => {
+    fakes = installFakes({ config: { budgets: { ...BUDGETS, maxConcurrent: 1 } } });
+    const alerts = Array.from({ length: 3 }, () => alertPayload());
+    const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
+    await sendWebhook(alerts[0]);
+    await sendWebhook(alerts[1]);
+    await vi.waitFor(() => expect(held.started).toHaveLength(1));
+
+    fakes.clock.advance(2 * 60 * 60_000); // the first Investigation is stuck far past its 30-minute limit
+    await sendWebhook(alerts[2]);
+
+    await vi.waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
+    await settle();
+    expect(held.started).toHaveLength(2);
+  });
+});
+
+describe("Daily budget", () => {
+  /** Below the cost of one Investigation with the scripted model, so the first one exhausts the day's budget. */
+  const TINY_BUDGET = { ...BUDGETS, dailyUsd: 0.000001 };
+
+  /** Sends an alert and waits for its one Teams message. */
+  async function alertAndWait(alert: ReturnType<typeof alertPayload>) {
+    const before = fakes.teams.posts.length;
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(before + 1));
+    await settle();
+    return fakes.teams.posts[before];
+  }
+
+  const investigatedMonitors = () => new Set(fakes.model.requests.map((r) => /Monitor ID: (\d+)/.exec(alertText(r))?.[1]));
+
+  it("skips new Alert episodes once the day's spend reaches the budget, with one notice to the Owning team", async () => {
+    fakes = installFakes({ config: { budgets: TINY_BUDGET } });
+    const first = alertPayload();
+    const second = alertPayload();
+
+    expect((await alertAndWait(first)).text).toMatch(/^Investigation report/);
+    const notice = await alertAndWait(second);
+
+    expect(notice.channel).toBe("sre");
+    expect(notice.text).toMatch(/budget exhausted, not investigated/i);
+    expect(notice.text).toContain(second.link);
+    expect(investigatedMonitors().has(second.monitorId)).toBe(false);
+
+    await sendWebhook(alertPayload({ monitorId: second.monitorId })); // a re-trigger of the skipped episode
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(2);
+    expect(investigatedMonitors().has(second.monitorId)).toBe(false);
+  });
+
+  it("does not skip while the day's spend is below the budget", async () => {
+    fakes = installFakes(); // $30 a day
+    for (let i = 0; i < 3; i++) {
+      expect((await alertAndWait(alertPayload())).text).toMatch(/^Investigation report/);
+    }
+  });
+
+  it("resets at 00:00 UTC", async () => {
+    fakes = installFakes({ config: { budgets: TINY_BUDGET }, now: Date.UTC(2026, 5, 1, 23, 50) });
+    await alertAndWait(alertPayload());
+
+    fakes.clock.set(Date.UTC(2026, 5, 1, 23, 59, 59));
+    expect((await alertAndWait(alertPayload())).text).toMatch(/budget exhausted/i);
+
+    fakes.clock.set(Date.UTC(2026, 5, 2, 0, 0, 0));
+    expect((await alertAndWait(alertPayload())).text).toMatch(/^Investigation report/);
+  });
+
+  it("skips Investigations still waiting for a run slot when the budget runs out, each with its notice", async () => {
+    fakes = installFakes({ config: { budgets: { ...TINY_BUDGET, maxConcurrent: 1 } } });
+    const alerts = Array.from({ length: 3 }, () => alertPayload());
+    const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
+    for (const alert of alerts) await sendWebhook(alert);
+    await vi.waitFor(() => expect(held.started).toHaveLength(1));
+
+    held.release(alerts[0].monitorId);
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(3));
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(3);
+    expect(fakes.teams.posts[0].text).toMatch(/^Investigation report/);
+    expect(fakes.teams.posts.slice(1).map((p) => /budget exhausted/i.test(p.text))).toEqual([true, true]);
+    expect(held.started).toEqual([alerts[0].monitorId]);
   });
 });

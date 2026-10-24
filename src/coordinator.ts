@@ -60,7 +60,9 @@ export class Coordinator extends DurableObject<Env> {
       return "granted";
     }
     if (!queue.some((q) => same(q, ref))) await this.#putQueue([...queue, ref]);
-    await this.#wakeAtFirstLapse(slots);
+    // A free slot with others waiting (e.g. one just lapsed): start the oldest waiting one now.
+    if (slots.length < this.#maxConcurrent()) await this.#scheduleDispatch("dispatch", 0);
+    else await this.#wakeAtFirstLapse(slots);
     return "queued";
   }
 
