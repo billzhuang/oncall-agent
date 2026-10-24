@@ -53,13 +53,15 @@ export async function cleanUp(): Promise<void> {
  * object's storage and alarm directly, then drop the instances so none keeps stale in-memory state.
  */
 async function wipeDurableObjects(): Promise<void> {
-  for (const ns of [env.INVESTIGATION, env.COORDINATOR] as DurableObjectNamespace[]) {
-    for (const id of await listDurableObjectIds(ns)) {
-      await runInDurableObject(ns.get(id), async (_instance, state) => {
-        await state.storage.deleteAlarm();
-        await state.storage.deleteAll();
-      });
-    }
+  const wipe = async (_instance: unknown, state: DurableObjectState) => {
+    await state.storage.deleteAlarm();
+    await state.storage.deleteAll();
+  };
+  for (const id of await listDurableObjectIds(env.INVESTIGATION)) {
+    await runInDurableObject(env.INVESTIGATION.get(id), wipe);
+  }
+  for (const id of await listDurableObjectIds(env.COORDINATOR)) {
+    await runInDurableObject(env.COORDINATOR.get(id), wipe);
   }
   await abortAllDurableObjects();
 }
