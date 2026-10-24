@@ -138,9 +138,27 @@ export class Investigation extends DurableObject<Env> {
     await this.#save(episode);
     // A durable job, not inline: it survives eviction, and keeps Datadog round trips out of the webhook.
     await this.lifecycle.jobs.push({ id: "run", fn: "run", time: Date.now() });
+    // A wake-up at the time limit (real time), so the limit holds even if the run is wedged between alarms.
+    const { budgets } = ports().config(this.env);
+    await this.lifecycle.jobs.push({ id: "deadline", fn: "deadline", time: Date.now() + budgets.investigationMinutes * 60_000 });
+  }
+
+  /** Every alarm (pi's heartbeat while the agent runs, job wake-ups otherwise) checks the time limit. */
+  async onAlarm(): Promise<void> {
+    await this.#checkDeadline();
+  }
+
+  /** Past its time limit, a Running Investigation is stopped (Partial), whatever its run is doing. */
+  async #checkDeadline(): Promise<void> {
+    const episode = await this.#episode();
+    if (!episode || episode.status !== "Running" || episode.startedAt === undefined) return;
+    const { budgets } = ports().config(this.env);
+    if (ports().now() - episode.startedAt < budgets.investigationMinutes * 60_000) return;
+    await this.#interrupt(`time limit of ${budgets.investigationMinutes} minutes reached`);
   }
 
   async onJob({ job }: LifecycleJobContext): Promise<void | { rescheduleAt: number }> {
+    if (job.fn === "deadline") return this.#checkDeadline();
     if (job.fn === "run") return this.#withBackoff(job.id, () => this.#run());
     if (job.fn === "finalize") return this.#withBackoff(job.id, () => this.#finalize());
   }

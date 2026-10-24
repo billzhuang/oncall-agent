@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { abortAllDurableObjects, runDurableObjectAlarm } from "cloudflare:test";
-import { alertPayload, cleanUp, installFakes, investigationOf, sendWebhook, settle, type Fakes } from "./harness";
+import { alertPayload, cleanUp, gate, installFakes, investigationOf, sendWebhook, settle, type Fakes } from "./harness";
 import { TEST_SECRETS } from "./config";
 import { toolCall, type Script } from "./fakes/model";
 
@@ -64,5 +64,40 @@ describe("30-minute limit", () => {
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
     expect(fakes.datadog.calls).toHaveLength(3);
+  });
+
+  it("stops a run wedged in a Datadog call when its alarm finds it past 30 minutes", async () => {
+    fakes = installFakes();
+    const held = gate();
+    fakes.datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, [
+      {
+        name: "search_datadog_logs",
+        result: async () => {
+          await held.opened; // never answers on its own
+          return { logs: ["late answer"] };
+        },
+      },
+    ]);
+    fakes.model.script(keepsSearching);
+    const alert = alertPayload();
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(fakes.datadog.calls).toHaveLength(1));
+
+    fakes.clock.advance(minutes(31));
+    await vi.waitFor(
+      async () => {
+        await runDurableObjectAlarm(investigationOf(alert));
+        expect(fakes.teams.posts).toHaveLength(1);
+      },
+      { timeout: 15_000, interval: 200 },
+    );
+
+    const [post] = fakes.teams.posts;
+    expect(post.text).toMatch(/partial/i);
+    expect(post.text).toMatch(/30 minutes/);
+    held.open();
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.datadog.calls).toHaveLength(1);
   });
 });
