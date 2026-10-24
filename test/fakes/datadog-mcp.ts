@@ -15,16 +15,48 @@ export interface DatadogRequest {
   method: string;
 }
 
+/** Source code integration git tags of a service, as its spans carry them. */
+export interface GitTags {
+  repositoryUrl: string;
+  commitSha: string;
+}
+
+/** The deployed commit every service reports unless a test says otherwise. */
+export const DEFAULT_COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567";
+
+/** Default git tags: every service lives in `github.com/acme/<service>`, which the fake GitHub App covers. */
+export const defaultGitTags = (service: string): GitTags => ({
+  repositoryUrl: `github.com/acme/${service}`,
+  commitSha: DEFAULT_COMMIT_SHA,
+});
+
+/** The span search the harness uses for repo resolution; served even when an Org's canned tools omit it. */
+const SPANS_TOOL = "search_datadog_spans";
+
 /** Datadog MCP endpoint path (host mcp.datadoghq.eu). */
 const MCP_PATH = "/v1/mcp";
 
 /**
  * In-test Datadog MCP server (Streamable HTTP, JSON responses only) at mcp.datadoghq.eu/v1/mcp.
  * Each Org is identified by the Bearer token (its Service Access Token) and has its own canned tools.
+ * Span searches an Org's canned tools do not cover are answered from a per-Org source code store (services and
+ * their git tags), recorded in `spanSearches` rather than `calls`.
  */
 export function fakeDatadogMcp() {
   const orgs = new Map<string, CannedTool[]>();
   const calls: Array<{ token: string; tool: string; args: unknown }> = [];
+  const spanSearches: Array<{ token: string; args: any }> = [];
+  /** Per Org token, per service: git tags, or null for a service whose spans carry none. */
+  const sourceCode = new Map<string, Map<string, GitTags | null>>();
+  /** Spans of the queried service, newest first, with the service's git tags (if any) among the span tags. */
+  const spans = (token: string, args: any) => {
+    const service = String(args?.query ?? "").match(/(?:^|\s)service:(\S+)/)?.[1];
+    if (!service) return { data: [] };
+    const known = sourceCode.get(token)?.get(service);
+    const git = known === undefined ? defaultGitTags(service) : known;
+    const gitTags = git ? [`git.repository_url:${git.repositoryUrl}`, `git.commit.sha:${git.commitSha}`] : [];
+    return { data: [{ service, resource_name: "GET /checkout", tags: [`service:${service}`, "env:prod", ...gitTags] }] };
+  };
   const requests: DatadogRequest[] = [];
   const service: FakeService = {
     async handle(request) {
@@ -57,8 +89,12 @@ export function fakeDatadogMcp() {
             })),
           });
         case "tools/call": {
-          calls.push({ token, tool: msg.params.name, args: msg.params.arguments });
           const tool = tools.find((t) => t.name === msg.params.name);
+          if (!tool && msg.params.name === SPANS_TOOL) {
+            spanSearches.push({ token, args: msg.params.arguments });
+            return reply({ content: [{ type: "text", text: JSON.stringify(spans(token, msg.params.arguments)) }] });
+          }
+          calls.push({ token, tool: msg.params.name, args: msg.params.arguments });
           if (!tool) return reply({ isError: true, content: [{ type: "text", text: "unknown tool" }] });
           const result = await tool.result(msg.params.arguments);
           return reply({ content: [{ type: "text", text: JSON.stringify(result) }] });
@@ -71,7 +107,13 @@ export function fakeDatadogMcp() {
   return {
     ...service,
     calls,
+    spanSearches,
     requests,
+    /** Sets a service's source code integration git tags in one Org (by token); null: its spans carry none. */
+    gitTags(token: string, service: string, tags: GitTags | null) {
+      if (!sourceCode.has(token)) sourceCode.set(token, new Map());
+      sourceCode.get(token)!.set(service, tags);
+    },
     /** Register an Org by its Service Access Token, with its canned tools (replacing any before). */
     org(token: string, tools: CannedTool[]) {
       orgs.set(token, tools);

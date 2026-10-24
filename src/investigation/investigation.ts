@@ -4,8 +4,10 @@ import { createRegistry } from "@earendil-works/pi-durable";
 import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
 import { orgByName, type Org } from "../config";
 import { DatadogConnection, type DatadogToolSpec } from "../datadog-mcp";
+import { coordinatorStub } from "../durable";
 import type { Alert } from "../intake";
 import { ports } from "../ports";
+import { codeLine, reminderFor, resolveRepo, type RepoResolution } from "../repo-resolution";
 import { postToTeams, teamsChannelSecret, type TeamsMessage, type TeamsMessageKind } from "../teams";
 import {
   MODEL_PROVIDER,
@@ -61,6 +63,10 @@ const RUN_POLL_MS = 30_000;
 const reportKey = (e: Episode) => `report:${e.number}`;
 const nudgedKey = (e: Episode) => `nudged:${e.number}`;
 const costBaselineKey = (e: Episode) => `cost-baseline:${e.number}`;
+/** The episode's RepoResolution; when resolved it holds `{repoUrl, sha}`, the code the workspace (#7) reads. */
+const repoKey = (e: Episode) => `repo:${e.number}`;
+/** Whether the Coordinator granted this episode's reminder (decided once, so a retried run job keeps the answer). */
+const reminderClaimKey = (e: Episode) => `reminder-claim:${e.number}`;
 /** The agent's one submission per Alert episode; pi ignores a second submit with the same id. */
 const operationId = (e: Episode) => `episode:${e.number}`;
 
@@ -132,13 +138,15 @@ export class Investigation extends DurableObject<Env> {
   }
 
   /**
-   * Gives the agent its one input for this Alert episode: the Org's read-only Datadog tools, the model from
-   * config, then the alert. Safe to re-run: the submit is idempotent by operation id.
+   * Resolves the repo (and reminds the Owning team when it cannot), then gives the agent its one input for this
+   * Alert episode: the Org's read-only Datadog tools, the model from config, then the alert. Safe to re-run:
+   * the resolution and the reminder are recorded, and the submit is idempotent by operation id.
    */
   async #run(): Promise<void> {
     const episode = await this.#episode();
     if (!episode || episode.status !== "Running") return;
     const config = ports().config(this.env);
+    await this.#remind(episode, await this.#resolveRepo(episode));
     if (!modelAvailable(this.env, config.modelId)) {
       return this.#endWithoutReport(episode, `the configured model ${config.modelId} is not available`);
     }
@@ -167,14 +175,44 @@ export class Investigation extends DurableObject<Env> {
     const report = await this.ctx.storage.get<InvestigationReport>(reportKey(episode));
     if (!report) return this.#endWithoutReport(episode, await this.#runEndReason(episode));
     const record = await this.#record(episode);
-    await this.#notify(episode, "report", reportMessage(episode.alert, report, record));
+    await this.#notify(episode, "report", reportMessage(episode.alert, report, record, await this.#codeLine(episode)));
     await this.#finish(episode, "Completed", record);
   }
 
   async #endWithoutReport(episode: Episode, reason: string): Promise<void> {
     const record = await this.#record(episode);
-    await this.#notify(episode, "failed", failedMessage(episode.alert, reason, record));
+    await this.#notify(episode, "failed", failedMessage(episode.alert, reason, record, await this.#codeLine(episode)));
     await this.#finish(episode, "Failed", record, reason);
+  }
+
+  /** Repo resolution for this Alert episode, done once by the harness (not the model) before the agent starts. */
+  async #resolveRepo(episode: Episode): Promise<RepoResolution> {
+    const stored = await this.ctx.storage.get<RepoResolution>(repoKey(episode));
+    if (stored) return stored;
+    const resolution = await resolveRepo(this.env, ports().config(this.env), this.datadog, episode.alert);
+    await this.ctx.storage.put(repoKey(episode), resolution);
+    return resolution;
+  }
+
+  /**
+   * Unmapped service or repo not enabled: reminds the Owning team, at most once per 7 days per key (the
+   * Coordinator's reminder ledger) and once per Alert episode (the outbox).
+   */
+  async #remind(episode: Episode, resolution: RepoResolution): Promise<void> {
+    const reminder = reminderFor(episode.alert.org, resolution);
+    if (!reminder) return;
+    let granted = await this.ctx.storage.get<boolean>(reminderClaimKey(episode));
+    if (granted === undefined) {
+      granted = await coordinatorStub(this.env).claimReminder(reminder.key);
+      await this.ctx.storage.put(reminderClaimKey(episode), granted);
+    }
+    if (granted) await this.#notify(episode, reminder.kind, reminder.message);
+  }
+
+  /** What the Investigation's messages say about the code, once repo resolution ran. */
+  async #codeLine(episode: Episode): Promise<string | undefined> {
+    const resolution = await this.ctx.storage.get<RepoResolution>(repoKey(episode));
+    return resolution && codeLine(resolution);
   }
 
   /** Why the agent's run ended without a report, in words for the failed message. */

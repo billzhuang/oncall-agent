@@ -8,7 +8,7 @@ import { fakeGitHub } from "./fakes/github";
 import { scriptedModel } from "./fakes/model";
 import { router } from "./fakes/router";
 import { fakeTeams } from "./fakes/teams";
-import { GAP_ORG_ID, MODEL_ID, TEST_SECRETS, WK_ORG_ID, testConfig } from "./config";
+import { GAP_ORG_ID, GITHUB_APP_ID, MODEL_ID, TEST_SECRETS, WK_ORG_ID, testConfig } from "./config";
 
 /**
  * Replaces every external system behind the Worker's outer edge with a fake the test controls,
@@ -17,7 +17,7 @@ import { GAP_ORG_ID, MODEL_ID, TEST_SECRETS, WK_ORG_ID, testConfig } from "./con
 export function installFakes(opts: { config?: Record<string, unknown>; now?: number } = {}) {
   const clock = fakeClock(opts.now);
   const teams = fakeTeams();
-  const github = fakeGitHub();
+  const github = fakeGitHub({ appId: GITHUB_APP_ID });
   const datadog = fakeDatadogMcp();
   const model = scriptedModel(String(opts.config?.modelId ?? MODEL_ID));
   datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, defaultDatadogTools("gap"));
