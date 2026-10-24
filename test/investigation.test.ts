@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { alertPayload, cleanUp, installFakes, sendWebhook, settle, type Fakes } from "./harness";
+import { abortAllDurableObjects, runDurableObjectAlarm } from "cloudflare:test";
+import {
+  alertPayload,
+  cleanUp,
+  gate,
+  installFakes,
+  investigationOf,
+  sendWebhook,
+  settle,
+  type Fakes,
+} from "./harness";
 import { TEST_SECRETS } from "./config";
 import { DATADOG_WRITE_TOOLS } from "./fakes/datadog-mcp";
 import { investigate, text, textOf, toolCall, type Transcript } from "./fakes/model";
@@ -14,6 +24,17 @@ afterEach(cleanUp);
 function actionUrls(body: unknown): string[] {
   const card = (body as any).attachments[0].content;
   return (card.actions ?? []).map((a: any) => a.url);
+}
+
+/** All text in the card body (title, lines, facts), excluding the action links. */
+function cardBodyText(body: unknown): string {
+  const card = (body as any).attachments[0].content;
+  const out: string[] = [];
+  for (const block of card.body) {
+    if (block.type === "TextBlock") out.push(block.text);
+    if (block.type === "FactSet") for (const f of block.facts) out.push(f.title, f.value);
+  }
+  return out.join("\n");
 }
 
 /** The structured `investigation.finished` records the Worker logged. */
@@ -43,6 +64,124 @@ describe("Investigation report", () => {
     expect(post.text).toContain("A null customer record reaches CheckoutController");
     expect(actionUrls(post.body)).toEqual([alert.link]);
     expect(fakes.datadog.calls.map((c) => c.tool)).toEqual(["search_datadog_logs"]);
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+  });
+});
+
+describe("Teams messages are plain text", () => {
+  /** Text a prompt-injected agent (or an attacker who controls log lines) might put in a report. */
+  const hostile = [
+    "Fix it here: [Datadog login](https://evil.example/login)",
+    "Details at https://evil.example/a?b=c and http://evil.example/plain",
+    "Or <https://evil.example/autolink> or <mailto:attacker@evil.example>",
+    "Mirror on www.evil.example/x and evil-login.com/reset and ops.evil.io",
+    "**Rotate** the _token_ now ~~please~~ `curl evil` ![img](https://evil.example/i.png)",
+    "# Heading",
+  ];
+
+  function expectInert(raw: string) {
+    expect(raw).not.toMatch(/(https?|mailto|ftp):/i);
+    expect(raw).not.toMatch(/www\./i);
+    expect(raw).not.toMatch(/evil-login\.com|evil\.io|evil\.example/);
+    expect(raw).not.toMatch(/(^|[^\\])\]\(/); // no markdown link or image syntax
+    expect(raw).not.toMatch(/(^|[^\\])</); // no autolink or HTML
+    expect(raw).not.toMatch(/(^|[^\\])\*\*/); // no bold
+    expect(raw).not.toMatch(/(^|[^\\])`/);
+    expect(raw).not.toMatch(/(^|\n)#/);
+  }
+
+  it("renders the agent's report as plain text: no markdown, no clickable URLs, only the monitor link", async () => {
+    fakes.model.script(
+      investigate({ report: () => ({ whatFired: hostile[0], evidence: hostile.slice(1), suspectedCause: hostile.join(" ") }) }),
+    );
+    const alert = alertPayload();
+
+    await sendWebhook(alert);
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    const [post] = fakes.teams.posts;
+    expect(actionUrls(post.body)).toEqual([alert.link]);
+    expectInert(cardBodyText(post.body));
+    expect(cardBodyText(post.body)).toContain("evil[.]example"); // still readable, defanged
+    expect(cardBodyText(post.body)).toContain("Rotate");
+  });
+
+  it("defangs bare URLs and <url> autolinks in the alert title", async () => {
+    const alert = alertPayload({ title: "[Triggered] see https://evil.example/x or <https://evil.example/y> www.evil.example" });
+
+    await sendWebhook(alert);
+
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    const [post] = fakes.teams.posts;
+    expect(actionUrls(post.body)).toEqual([alert.link]);
+    expectInert(cardBodyText(post.body));
+  });
+});
+
+describe("Eviction", () => {
+  it("resumes an Investigation evicted mid-run when its alarm fires, and posts its report once", async () => {
+    const held = gate();
+    let searches = 0;
+    fakes.datadog.org(TEST_SECRETS.GAP_DATADOG_TOKEN, [
+      {
+        name: "search_datadog_logs",
+        result: async () => {
+          searches++;
+          await held.opened;
+          return { logs: ["OutOfMemoryError in checkout-worker"] };
+        },
+      },
+    ]);
+    const alert = alertPayload();
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(searches).toBe(1));
+
+    await abortAllDurableObjects(); // evicted while the Datadog call is in flight
+    held.open();
+    await vi.waitFor(
+      async () => {
+        await runDurableObjectAlarm(investigationOf(alert));
+        expect(fakes.teams.posts).toHaveLength(1);
+      },
+      { timeout: 15_000, interval: 200 },
+    );
+
+    expect(fakes.teams.posts[0].text).toContain("OutOfMemoryError in checkout-worker");
+    expect(searches).toBe(2); // the read-only call was re-run after the restart
+    await settle();
+    expect(fakes.teams.posts).toHaveLength(1);
+  });
+
+  it("does not post the report again or rerun the agent after an eviction that follows it", async () => {
+    const alert = alertPayload();
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    await settle();
+    const modelRequests = fakes.model.requests.length;
+
+    await abortAllDurableObjects();
+    await runDurableObjectAlarm(investigationOf(alert));
+    await settle();
+
+    expect(fakes.teams.posts).toHaveLength(1);
+    expect(fakes.model.requests).toHaveLength(modelRequests);
+  });
+
+  it("does not post the report twice when Teams fails and the Investigation is evicted before it retries", async () => {
+    fakes.teams.fail(1);
+    const alert = alertPayload();
+    await sendWebhook(alert);
+    await vi.waitFor(() => expect(fakes.model.requests.length).toBeGreaterThanOrEqual(2));
+
+    await abortAllDurableObjects();
+    await vi.waitFor(
+      async () => {
+        await runDurableObjectAlarm(investigationOf(alert));
+        expect(fakes.teams.posts).toHaveLength(1);
+      },
+      { timeout: 15_000, interval: 250 },
+    );
     await settle();
     expect(fakes.teams.posts).toHaveLength(1);
   });

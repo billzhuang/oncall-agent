@@ -56,21 +56,49 @@ export async function postToTeams(env: Env, channelSecret: string, message: Team
   if (!res.ok) throw new Error(`Teams webhook ${channelSecret} answered ${res.status}`);
 }
 
+/** A URL with a scheme (`https://…`, `ftp://…`), or a scheme Teams opens without `//` (`mailto:…`). */
+const SCHEME_URL = /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s<>"']*|\b(?:mailto|tel|sms|sip|callto|skype|msteams|javascript|vbscript|data|file):[^\s<>"']*/gi;
+/** `www.` hosts, which markdown autolinks without a scheme. */
+const WWW_URL = /\bwww\.[^\s<>"']*/gi;
+/** Top-level domains a linkifier treats as links without a scheme: common generic ones and every 2-letter ccTLD. */
+const TLD = "com|net|org|edu|gov|mil|int|info|biz|pro|name|aero|asia|coop|museum|mobi|jobs|travel|app|dev|xyz|online|site|top|club|shop|cloud|[a-z]{2}";
+/** A bare domain (`evil-login.com`, `ops.evil.io`). */
+const BARE_DOMAIN = new RegExp(`\\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:${TLD})\\b`, "gi");
+
+/** Escapes markdown in one line: emphasis, code, links and images, autolinks/HTML; headings, lists, quotes. */
+function escapeMarkdownLine(line: string): string {
+  return line
+    .replace(/[\\`*_~[\]()<>|]/g, (c) => `\\${c}`)
+    .replace(/^(\s*)([#+\-=])/, "$1\\$2")
+    .replace(/^(\s*\d+)([.)])/, "$1\\$2");
+}
+
+/** Defangs URLs so no renderer finds one: `https[:]//evil[.]example/x`, `www[.]evil[.]example`, `evil-login[.]com`. */
+function defang(text: string): string {
+  const dots = (s: string) => s.replace(/\./g, "[.]");
+  return text
+    .replace(SCHEME_URL, (url) => dots(url.replace(":", "[:]")))
+    .replace(WWW_URL, dots)
+    .replace(BARE_DOMAIN, dots);
+}
+
 /**
- * Message text includes untrusted alert text, and Adaptive Card text renders a markdown subset, so break
- * markdown link syntax: links appear only as the card's own actions, built from trusted URLs.
+ * Renders untrusted text (alert text, model-written report lines, anything echoed from logs) as plain text in
+ * an Adaptive Card, whose TextBlocks render a markdown subset and Teams autolinks URLs. Markdown is escaped
+ * first (parentheses too); then URLs are defanged, inserting `[:]`/`[.]`, which form no markdown: never at a
+ * line start, and never followed by an unescaped `(`. The only links in a message are the card's own actions, built by the harness from trusted URLs.
  */
-function inert(text: string): string {
-  return text.replace(/\]\s*\(/g, "] (");
+export function plain(text: string): string {
+  return defang(text.split(/\r?\n/).map(escapeMarkdownLine).join("\n"));
 }
 
 function adaptiveCard(message: TeamsMessage) {
   const body: unknown[] = [
-    { type: "TextBlock", text: inert(message.title), weight: "Bolder", size: "Medium", wrap: true },
-    ...message.lines.map((text) => ({ type: "TextBlock", text: inert(text), wrap: true })),
+    { type: "TextBlock", text: plain(message.title), weight: "Bolder", size: "Medium", wrap: true },
+    ...message.lines.map((text) => ({ type: "TextBlock", text: plain(text), wrap: true })),
   ];
   if (message.facts?.length) {
-    body.push({ type: "FactSet", facts: message.facts.map(([title, value]) => ({ title: inert(title), value: inert(value) })) });
+    body.push({ type: "FactSet", facts: message.facts.map(([title, value]) => ({ title: plain(title), value: plain(value) })) });
   }
   const content: Record<string, unknown> = {
     $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
