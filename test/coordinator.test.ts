@@ -90,15 +90,33 @@ describe("Concurrency", () => {
     await sendWebhook(alerts[1]);
     await vi.waitFor(() => expect(held.started).toHaveLength(1));
 
-    // Past the run slot's lease (time limit plus slack). No settle(): it would run the Investigation's alarm,
-    // and the time limit (#4) may then rightly stop the first Investigation and free its slot.
-    fakes.clock.advance(46 * 60_000);
+    // Past the run slot's lease (30-minute limit plus 5), short of its hard cap (plus 15). No settle(): it would
+    // run the Investigation's alarm, and the time limit (#4) may then rightly stop it and free its slot.
+    fakes.clock.advance(40 * 60_000);
     await sendWebhook(alerts[2]);
     await new Promise((r) => setTimeout(r, 500));
     expect(held.started).toEqual([alerts[0].monitorId]);
 
     held.release(alerts[0].monitorId);
     await vi.waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
+  });
+
+  it("takes back the run slot of an Investigation stuck past its hard cap, stopping it with a failed message", async () => {
+    fakes = installFakes({ config: { budgets: { ...BUDGETS, maxConcurrent: 1 } } });
+    const alerts = Array.from({ length: 3 }, () => alertPayload());
+    const held = holdInvestigations(fakes, alerts.map((a) => a.monitorId));
+    await sendWebhook(alerts[0]);
+    await sendWebhook(alerts[1]);
+    await vi.waitFor(() => expect(held.started).toHaveLength(1));
+
+    fakes.clock.advance(46 * 60_000); // stuck in a Datadog call past the 30-minute limit plus 15
+    await sendWebhook(alerts[2]);
+
+    await vi.waitFor(() => expect(held.started).toEqual([alerts[0].monitorId, alerts[1].monitorId]));
+    await vi.waitFor(() => expect(fakes.teams.posts).toHaveLength(1));
+    expect(fakes.teams.posts[0].text).toMatch(/^Investigation failed/);
+    expect(fakes.teams.posts[0].text).toContain(alerts[0].monitorId);
+    expect(held.started).toHaveLength(2);
   });
 });
 
