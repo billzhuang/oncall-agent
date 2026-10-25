@@ -27,7 +27,7 @@ The people responsible for the files an Agent PR changes; they review it.
 _Avoid_: Reviewers, maintainers
 
 **Unmapped service**:
-A service whose alerts carry no Datadog link to its source repository, so the agent cannot find its code.
+A service the agent cannot tie, through Datadog, to one source repository and deployed version (no link at all, conflicting links, or no service named on the monitor), so it cannot find its code.
 _Avoid_: Unknown repo, orphan service
 
 **Alert episode**:
@@ -49,5 +49,5 @@ A draft pull request the agent opens when an Investigation traces the cause to s
 _Avoid_: Fix PR, auto-PR
 
 **Report-only mode**:
-A setting under which Investigations still produce Investigation reports but never open Agent PRs.
+The default for every Owning team: its Investigations produce Investigation reports but never open Agent PRs. A team leaves it only when it is explicitly allowed Agent PRs, and switching it on globally puts every team back in it.
 _Avoid_: Dry run, shadow mode

@@ -4,7 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Design only: no code, build, lint or test commands exist yet. When the Worker is scaffolded, add its commands here.
+A single Cloudflare Worker (`src/index.ts`) with Investigation and Coordinator Durable Objects. Node 22, npm 11, exact pins (`.npmrc` `save-exact=true`).
+
+- `npm test`: Vitest with `@cloudflare/vitest-plugin`; runs the real Worker in workerd.
+- `npm run typecheck`: `tsc --noEmit`.
+- `npm run types`: regenerates `worker-configuration.d.ts`; rerun and commit after any `wrangler.jsonc` change.
+
+Testing: drive only the Worker's outer edge (webhook, scheduled event, Durable Object alarms) and assert only outward effects. External systems are reached only through `src/ports.ts`; tests swap them for the fakes in `test/fakes/`, wired by `installFakes()` in `test/harness.ts`. Test secrets and the test Org registry are in `test/config.ts`. The one exception: the clone in `src/workspace/computer.ts` uses isomorphic-git's global `fetch`, so tests replace that whole adapter.
 
 ## Where the design lives
 
