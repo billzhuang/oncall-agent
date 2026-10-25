@@ -10,7 +10,7 @@ A single Cloudflare Worker (`src/index.ts`) with Investigation and Coordinator D
 - `npm run typecheck`: `tsc --noEmit`.
 - `npm run types`: regenerates `worker-configuration.d.ts`; rerun and commit after any `wrangler.jsonc` change.
 
-Testing: drive only the Worker's outer edge (webhook, scheduled event, Durable Object alarms) and assert only outward effects. External systems are reached only through `src/ports.ts`; tests swap them for the fakes in `test/fakes/`, wired by `installFakes()` in `test/harness.ts`. Test secrets and the test Org registry are in `test/config.ts`.
+Testing: drive only the Worker's outer edge (webhook, scheduled event, Durable Object alarms) and assert only outward effects. External systems are reached only through `src/ports.ts`; tests swap them for the fakes in `test/fakes/`, wired by `installFakes()` in `test/harness.ts`. Test secrets and the test Org registry are in `test/config.ts`. The one exception: the clone in `src/workspace/computer.ts` uses isomorphic-git's global `fetch`, so tests replace that whole adapter.
 
 ## Where the design lives
 
